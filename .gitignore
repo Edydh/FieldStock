@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+db/fieldstock.db
+
+.DS_Store
+Thumbs.db
