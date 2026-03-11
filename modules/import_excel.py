@@ -8,7 +8,7 @@ import pandas as pd
 import sqlite3
 
 from modules.db import clear_balances_for_missing_keys, upsert_location, upsert_part, set_inventory_balance
-from modules.utils import safe_float
+from modules.utils import normalize_part_number, normalize_text, safe_float
 
 
 DEFAULT_COLUMN_MAP = {
@@ -29,6 +29,17 @@ class ImportResult:
     rows_read: int
     rows_imported: int
     balances_zeroed: int
+
+
+@dataclass
+class ImportImpactResult:
+    rows_to_import: int
+    new_balances: int
+    updated_balances: int
+    unchanged_balances: int
+    balances_to_zero: int
+    balance_change_preview: list[dict[str, Any]]
+    zero_balance_preview: list[dict[str, Any]]
 
 
 def read_excel_preview(file_bytes: bytes, max_rows: int = 20) -> tuple[pd.DataFrame, list[str]]:
@@ -128,6 +139,124 @@ def import_snapshot(
         rows_read=len(prepared.index),
         rows_imported=len(prepared.index),
         balances_zeroed=zeroed,
+    )
+
+
+def analyze_snapshot_import(
+    conn: sqlite3.Connection,
+    file_bytes: bytes,
+    column_map: dict[str, str] | None = None,
+) -> ImportImpactResult:
+    mapping = column_map or DEFAULT_COLUMN_MAP
+    prepared = _prepare_dataframe(file_bytes, mapping)
+    existing_rows = conn.execute(
+        """
+        SELECT
+            p.part_number,
+            p.description,
+            p.manufacturer,
+            p.uom,
+            p.normalized_part_number,
+            l.warehouse_code,
+            l.location_code,
+            ib.qty_on_hand
+        FROM inventory_balances ib
+        INNER JOIN parts p ON p.id = ib.part_id
+        INNER JOIN locations l ON l.id = ib.location_id
+        """
+    ).fetchall()
+
+    existing_by_key: dict[tuple[str, str, str], sqlite3.Row] = {}
+    for row in existing_rows:
+        key = (
+            str(row["normalized_part_number"]),
+            normalize_text(row["warehouse_code"]),
+            normalize_text(row["location_code"]),
+        )
+        existing_by_key[key] = row
+
+    imported_keys: set[tuple[str, str, str]] = set()
+    balance_change_preview: list[dict[str, Any]] = []
+    new_balances = 0
+    updated_balances = 0
+    unchanged_balances = 0
+
+    for row in prepared.itertuples(index=False):
+        key = (
+            normalize_part_number(row.part_number),
+            normalize_text(row.warehouse),
+            normalize_text(row.location_code),
+        )
+        imported_keys.add(key)
+        existing = existing_by_key.get(key)
+        new_qty = float(row.quantity)
+
+        if existing is None:
+            new_balances += 1
+            balance_change_preview.append(
+                {
+                    "change_type": "New balance",
+                    "part_number": row.part_number,
+                    "description": row.description,
+                    "OEM": row.manufacturer,
+                    "warehouse_code": normalize_text(row.warehouse),
+                    "location_code": normalize_text(row.location_code),
+                    "previous_qty": 0.0,
+                    "new_qty": new_qty,
+                    "qty_change": new_qty,
+                }
+            )
+            continue
+
+        previous_qty = float(existing["qty_on_hand"])
+        if previous_qty == new_qty:
+            unchanged_balances += 1
+            continue
+
+        updated_balances += 1
+        balance_change_preview.append(
+            {
+                "change_type": "Update balance",
+                "part_number": row.part_number,
+                "description": row.description,
+                "OEM": row.manufacturer or existing["manufacturer"],
+                "warehouse_code": normalize_text(row.warehouse),
+                "location_code": normalize_text(row.location_code),
+                "previous_qty": previous_qty,
+                "new_qty": new_qty,
+                "qty_change": new_qty - previous_qty,
+            }
+        )
+
+    zero_balance_preview: list[dict[str, Any]] = []
+    for key, row in existing_by_key.items():
+        if key in imported_keys:
+            continue
+        previous_qty = float(row["qty_on_hand"])
+        if previous_qty == 0:
+            continue
+        zero_balance_preview.append(
+            {
+                "change_type": "Zero missing balance",
+                "part_number": row["part_number"],
+                "description": row["description"],
+                "OEM": row["manufacturer"],
+                "warehouse_code": row["warehouse_code"],
+                "location_code": row["location_code"],
+                "previous_qty": previous_qty,
+                "new_qty": 0.0,
+                "qty_change": -previous_qty,
+            }
+        )
+
+    return ImportImpactResult(
+        rows_to_import=len(prepared.index),
+        new_balances=new_balances,
+        updated_balances=updated_balances,
+        unchanged_balances=unchanged_balances,
+        balances_to_zero=len(zero_balance_preview),
+        balance_change_preview=balance_change_preview,
+        zero_balance_preview=zero_balance_preview,
     )
 
 

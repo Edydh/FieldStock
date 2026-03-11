@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment
-from modules.import_excel import import_snapshot, summarize_import
+from modules.import_excel import analyze_snapshot_import, import_snapshot, summarize_import
 from modules.search import search_inventory
 
 
@@ -288,6 +288,98 @@ def test_snapshot_import_stores_oem_in_search_results(conn: sqlite3.Connection) 
     assert row["manufacturer"] == "Samsung"
     assert len(rows) == 1
     assert rows[0]["oem"] == "Samsung"
+
+
+def test_analyze_snapshot_import_summarizes_expected_balance_changes(conn: sqlite3.Connection) -> None:
+    initial_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            },
+            {
+                "Product identification": "P-200",
+                "Product name": "Drive 600GB",
+                "Warehouse": "Main",
+                "Location": "B2",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            },
+        ]
+    )
+    next_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 4,
+            },
+            {
+                "Product identification": "P-300",
+                "Product name": "Drive 900GB",
+                "Warehouse": "Main",
+                "Location": "C3",
+                "Inventory unit": "EA",
+                "Total available": 1,
+            },
+        ]
+    )
+
+    import_snapshot(
+        conn=conn,
+        file_bytes=initial_file,
+        column_map=None,
+        created_by="tester",
+        reference="import-001",
+    )
+
+    impact = analyze_snapshot_import(conn, next_file)
+
+    assert impact.rows_to_import == 2
+    assert impact.new_balances == 1
+    assert impact.updated_balances == 1
+    assert impact.unchanged_balances == 0
+    assert impact.balances_to_zero == 1
+    assert {row["change_type"] for row in impact.balance_change_preview} == {"New balance", "Update balance"}
+    assert impact.zero_balance_preview[0]["part_number"] == "P-200"
+
+
+def test_analyze_snapshot_import_counts_unchanged_balances(conn: sqlite3.Connection) -> None:
+    file_bytes = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            }
+        ]
+    )
+
+    import_snapshot(
+        conn=conn,
+        file_bytes=file_bytes,
+        column_map=None,
+        created_by="tester",
+        reference="import-001",
+    )
+
+    impact = analyze_snapshot_import(conn, file_bytes)
+
+    assert impact.rows_to_import == 1
+    assert impact.new_balances == 0
+    assert impact.updated_balances == 0
+    assert impact.unchanged_balances == 1
+    assert impact.balances_to_zero == 0
 
 
 def test_search_inventory_available_only_filters_zero_stock(conn: sqlite3.Connection) -> None:

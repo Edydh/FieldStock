@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
-from modules.import_excel import DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, summarize_import
+from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, summarize_import
 from modules.search import recent_transactions, search_inventory, search_inventory_records
 
 
@@ -52,6 +52,8 @@ with import_tab:
         try:
             preview_df, source_columns = read_excel_preview(file_bytes)
             summary = summarize_import(file_bytes, column_map)
+            with get_connection() as conn:
+                impact = analyze_snapshot_import(conn, file_bytes, column_map)
         except Exception as exc:
             st.error(f"Unable to read the uploaded file: {exc}")
         else:
@@ -61,11 +63,34 @@ with import_tab:
             metric_columns[2].metric("Locations", summary["locations"])
             metric_columns[3].metric("Total Quantity", f"{summary['total_quantity']:.2f}")
 
+            impact_columns = st.columns(5)
+            impact_columns[0].metric("Rows To Import", impact.rows_to_import)
+            impact_columns[1].metric("New Balances", impact.new_balances)
+            impact_columns[2].metric("Updated Balances", impact.updated_balances)
+            impact_columns[3].metric("Unchanged Balances", impact.unchanged_balances)
+            impact_columns[4].metric("Balances To Zero", impact.balances_to_zero)
+
+            st.caption(f"Import reference: {reference.strip() or 'snapshot-import'}")
+            st.caption(f"Preview generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            if impact.balances_to_zero > 0:
+                st.warning(
+                    f"This snapshot will zero {impact.balances_to_zero} existing non-zero balance(s) that are missing from the file."
+                )
+
             st.write("Source columns detected:")
             st.write(pd.DataFrame({"column_name": source_columns}))
 
             st.write("Preview:")
             st.dataframe(preview_df, use_container_width=True)
+
+            if impact.balance_change_preview:
+                st.write("Expected balance changes:")
+                st.dataframe(pd.DataFrame(impact.balance_change_preview).head(25), use_container_width=True)
+
+            if impact.zero_balance_preview:
+                st.write("Balances that will be zeroed:")
+                st.dataframe(pd.DataFrame(impact.zero_balance_preview).head(25), use_container_width=True)
 
             if st.button("Apply Snapshot Import", type="primary"):
                 try:
