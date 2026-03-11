@@ -101,6 +101,7 @@ def recent_transactions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
             t.qty_change,
             t.reference,
             t.created_by,
+            t.notes,
             p.part_number,
             l.warehouse_code,
             l.location_code

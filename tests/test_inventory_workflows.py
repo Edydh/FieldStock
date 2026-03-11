@@ -9,7 +9,7 @@ import pytest
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, import_snapshot, recent_import_runs, summarize_import
-from modules.search import search_inventory, transactions_for_import_run
+from modules.search import recent_transactions, search_inventory, transactions_for_import_run
 
 
 def make_connection() -> sqlite3.Connection:
@@ -233,6 +233,49 @@ def test_manual_adjustment_rejects_negative_inventory(conn: sqlite3.Connection) 
     assert unchanged_balance is not None
     assert float(unchanged_balance["qty_on_hand"]) == 1.0
     assert adjustment_transactions == 0
+
+
+def test_recent_transactions_includes_manual_adjustment_notes(conn: sqlite3.Connection) -> None:
+    file_bytes = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-300",
+                "Product name": "Memory 16GB",
+                "Warehouse": "Main",
+                "Location": "C3",
+                "Inventory unit": "EA",
+                "Total available": 3,
+            }
+        ]
+    )
+
+    import_snapshot(
+        conn=conn,
+        file_bytes=file_bytes,
+        column_map=None,
+        created_by="tester",
+        reference="import-001",
+    )
+
+    balance_row = conn.execute(
+        "SELECT part_id, location_id FROM inventory_balances LIMIT 1"
+    ).fetchone()
+
+    record_inventory_adjustment(
+        conn=conn,
+        part_id=int(balance_row["part_id"]),
+        location_id=int(balance_row["location_id"]),
+        qty_change=-1,
+        created_by="tester",
+        reference="adjust-001",
+        notes="Consumed one DIMM for bench repair",
+    )
+
+    transactions = recent_transactions(conn)
+
+    assert len(transactions) >= 1
+    assert transactions[0]["reference"] == "adjust-001"
+    assert transactions[0]["notes"] == "Consumed one DIMM for bench repair"
 
 
 def test_search_inventory_matches_normalized_part_number(conn: sqlite3.Connection) -> None:
