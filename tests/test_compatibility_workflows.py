@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_search_results
+from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_product_page, parse_harddrivesdirect_search_results
 from modules.reference_search import compatibility_inventory_for_model, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
@@ -501,6 +501,118 @@ def test_import_reference_html_imports_search_results_listing(conn: sqlite3.Conn
         assert result.parts_upserted == 1
         assert result.compatibilities_upserted >= 1
         assert models
+
+
+def test_parse_harddrivesdirect_product_page_extracts_aliases_and_attributes() -> None:
+        html = """
+        <html>
+            <head><title>461137-B21 HP 1-TB 3G 7.2K 3.5 DP SAS</title></head>
+            <body>
+                <h1>461137-B21 HP 1-TB 3G 7.2K 3.5 DP SAS</h1>
+                <p>
+                    Description: HP 1TB 3.5-inch LFF SAS 3Gb/s 7.2K RPM Midline (MDL) Dual Port (DP) Hot-Plug Hard Drive
+                    In HP 3.5-inch LFF SAS Hot-Plug Hard Drive tray (as pictured)
+                    For HP G1-G7 Proliant SAS Servers and Storage Arrays
+                    Genuine HP Serial number and Firmware
+                </p>
+                <p>
+                    Part Number(s)
+                    Option Part# 461137-B21
+                    SmartBuy Part# 461137-S21
+                    Spare Part# 461289-001
+                    Assembly Part# 461134-003
+                    Model# MB1000BAWJP
+                </p>
+                <p>
+                    Specifications:
+                    Category Proliant HardDrive
+                    Sub-Category 7.2K
+                    Generation SAS
+                    Part Number 461137-B21
+                    Products ID 455653
+                    Capacity 1TB
+                    Interface Serial Attached SCSI (SAS)
+                    Drive Dimensions 3.5 inches x 1/3H (Low Profile)
+                    Spindle Speed 7200RPM
+                    External Data Transfer 3GB/s
+                    Ports Dual Port
+                </p>
+            </body>
+        </html>
+        """
+
+        row = parse_harddrivesdirect_product_page(html, "https://www.harddrivesdirect.com/product_info.php?products_id=455653")
+
+        assert row is not None
+        assert row["part_number"] == "461137-B21"
+        assert "461137-S21" in row["aliases"]
+        assert row["attributes"]["capacity"] == "1TB"
+        assert row["attributes"]["ports"] == "DUAL PORT"
+        assert row["attributes"]["model_number"] == "MB1000BAWJP"
+
+
+def test_analyze_reference_html_classifies_product_detail_page() -> None:
+        html = """
+        <html>
+            <head><title>461137-B21 HP 1-TB 3G 7.2K 3.5 DP SAS</title></head>
+            <body>
+                <p>Part Number(s) Option Part# 461137-B21 SmartBuy Part# 461137-S21</p>
+                <p>Specifications: Capacity 1TB Interface Serial Attached SCSI (SAS)</p>
+            </body>
+        </html>
+        """
+
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/product_info.php?products_id=455653")
+
+        assert analysis.page_kind == "product_detail"
+        assert analysis.rows_detected == 1
+
+
+def test_import_reference_html_imports_product_detail_attributes(conn: sqlite3.Connection) -> None:
+        html = """
+        <html>
+            <head><title>461137-B21 HP 1-TB 3G 7.2K 3.5 DP SAS</title></head>
+            <body>
+                <h1>461137-B21 HP 1-TB 3G 7.2K 3.5 DP SAS</h1>
+                <p>
+                    Description: HP 1TB 3.5-inch LFF SAS 3Gb/s 7.2K RPM Midline (MDL) Dual Port (DP) Hot-Plug Hard Drive
+                    For HP G1-G7 Proliant SAS Servers and Storage Arrays
+                </p>
+                <p>
+                    Part Number(s)
+                    Option Part# 461137-B21
+                    SmartBuy Part# 461137-S21
+                    Spare Part# 461289-001
+                    Assembly Part# 461134-003
+                    Model# MB1000BAWJP
+                </p>
+                <p>
+                    Specifications:
+                    Category Proliant HardDrive
+                    Capacity 1TB
+                    Interface Serial Attached SCSI (SAS)
+                    Ports Dual Port
+                </p>
+            </body>
+        </html>
+        """
+
+        result = import_reference_html(
+                conn,
+                html=html,
+                page_url="https://www.harddrivesdirect.com/product_info.php?products_id=455653",
+                source_name="461137 Product Page",
+        )
+
+        alias_rows = conn.execute("SELECT alias_part_number FROM reference_part_aliases ORDER BY alias_part_number").fetchall()
+        attribute_rows = conn.execute(
+                "SELECT attribute_name, attribute_value FROM reference_part_attributes ORDER BY attribute_name"
+        ).fetchall()
+
+        assert result.rows_seen == 1
+        assert any(row[0] == "461137-S21" for row in alias_rows)
+        assert any(row[0] == "capacity" and row[1] == "1TB" for row in attribute_rows)
+        assert any(row[0] == "ports" and row[1] == "DUAL PORT" for row in attribute_rows)
 
 
 def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:

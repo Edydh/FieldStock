@@ -108,6 +108,19 @@ CREATE TABLE IF NOT EXISTS reference_part_aliases (
     FOREIGN KEY(reference_part_id) REFERENCES reference_parts(id)
 );
 
+CREATE TABLE IF NOT EXISTS reference_part_attributes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_part_id INTEGER NOT NULL,
+    attribute_name TEXT NOT NULL,
+    attribute_value TEXT NOT NULL,
+    normalized_attribute_name TEXT NOT NULL,
+    normalized_attribute_value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(reference_part_id, normalized_attribute_name),
+    FOREIGN KEY(reference_part_id) REFERENCES reference_parts(id)
+);
+
 CREATE TABLE IF NOT EXISTS system_part_compatibility (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     system_model_id INTEGER NOT NULL,
@@ -158,5 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_import_runs_created_at ON import_runs(created_at)
 CREATE INDEX IF NOT EXISTS idx_system_models_normalized_model_name ON system_models(normalized_model_name);
 CREATE INDEX IF NOT EXISTS idx_reference_parts_normalized_part_number ON reference_parts(normalized_part_number);
 CREATE INDEX IF NOT EXISTS idx_reference_part_aliases_normalized_alias_part_number ON reference_part_aliases(normalized_alias_part_number);
+CREATE INDEX IF NOT EXISTS idx_reference_part_attributes_name ON reference_part_attributes(normalized_attribute_name);
+CREATE INDEX IF NOT EXISTS idx_reference_part_attributes_value ON reference_part_attributes(normalized_attribute_value);
 CREATE INDEX IF NOT EXISTS idx_system_part_compatibility_system_model_id ON system_part_compatibility(system_model_id);
 CREATE INDEX IF NOT EXISTS idx_system_part_compatibility_reference_part_id ON system_part_compatibility(reference_part_id);

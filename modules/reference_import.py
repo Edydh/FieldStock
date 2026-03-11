@@ -58,6 +58,32 @@ class ReferenceHtmlAnalysis:
     guidance: str
 
 
+PRODUCT_ATTRIBUTE_LABELS = {
+    "OPTION PART#": "option_part_number",
+    "SMARTBUY PART#": "smartbuy_part_number",
+    "SPARE PART#": "spare_part_number",
+    "ASSEMBLY PART#": "assembly_part_number",
+    "MODEL#": "model_number",
+    "CATEGORY": "category",
+    "SUB-CATEGORY": "sub_category",
+    "GENERATION": "generation",
+    "PART NUMBER": "part_number",
+    "PRODUCTS ID": "product_id",
+    "CAPACITY": "capacity",
+    "INTERFACE": "interface",
+    "ENCLOSURE": "enclosure",
+    "DRIVE DIMENSIONS": "drive_dimensions",
+    "SPINDLE SPEED": "spindle_speed",
+    "EXTERNAL DATA TRANSFER": "external_data_transfer",
+    "SEEK TIME": "seek_time",
+    "HOTSWAP": "hot_swap",
+    "MANUFACTURER": "manufacturer_name",
+    "LIMITED WARRANTY": "limited_warranty",
+    "HOT SWAP TRAY": "hot_swap_tray",
+    "PORTS": "ports",
+}
+
+
 def extract_candidate_models(product_name: str) -> list[str]:
     cleaned = normalize_text(product_name)
     cleaned = re.sub(r"\(\s*(G\d+(?:\+)?)\s*\)", r" \1", cleaned)
@@ -242,6 +268,41 @@ def _upsert_reference_aliases(
     return inserted
 
 
+def _upsert_reference_attributes(
+    conn: sqlite3.Connection,
+    reference_part_id: int,
+    attributes: dict[str, str],
+) -> int:
+    updated = 0
+    for name, value in attributes.items():
+        cleaned_name = name.strip()
+        cleaned_value = str(value).strip()
+        if not cleaned_name or not cleaned_value:
+            continue
+        normalized_name = normalize_text(cleaned_name)
+        normalized_value = normalize_text(cleaned_value)
+        cursor = conn.execute(
+            """
+            INSERT INTO reference_part_attributes (
+                reference_part_id,
+                attribute_name,
+                attribute_value,
+                normalized_attribute_name,
+                normalized_attribute_value
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(reference_part_id, normalized_attribute_name) DO UPDATE SET
+                attribute_name = excluded.attribute_name,
+                attribute_value = excluded.attribute_value,
+                normalized_attribute_value = excluded.normalized_attribute_value,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (reference_part_id, cleaned_name, cleaned_value, normalized_name, normalized_value),
+        )
+        if cursor.rowcount > 0:
+            updated += 1
+    return updated
+
+
 def _upsert_compatibility(
     conn: sqlite3.Connection,
     system_model_id: int,
@@ -323,6 +384,10 @@ def import_reference_rows(
         if isinstance(alias_values, str):
             alias_values = [value.strip() for value in alias_values.split(",") if value.strip()]
         aliases_upserted += _upsert_reference_aliases(conn, reference_part_id, alias_values)
+
+        attribute_values = row.get("attributes") or {}
+        if isinstance(attribute_values, dict):
+            _upsert_reference_attributes(conn, reference_part_id, {str(key): str(value) for key, value in attribute_values.items()})
 
         model_names = list(explicit_models) or extract_candidate_models(description)
         for model_name in model_names:
@@ -466,7 +531,110 @@ def parse_reference_rows(html: str, page_url: str) -> list[dict[str, object]]:
     combined_rows = parse_harddrivesdirect_listing(html, page_url)
     if combined_rows:
         return combined_rows
-    return parse_harddrivesdirect_search_results(html, page_url)
+    search_rows = parse_harddrivesdirect_search_results(html, page_url)
+    if search_rows:
+        return search_rows
+    product_row = parse_harddrivesdirect_product_page(html, page_url)
+    return [product_row] if product_row is not None else []
+
+
+def _extract_product_text_block(normalized_text: str, start_label: str, end_labels: tuple[str, ...]) -> str:
+    start_index = normalized_text.find(start_label)
+    if start_index == -1:
+        return ""
+    block = normalized_text[start_index + len(start_label):]
+    end_positions = [block.find(label) for label in end_labels if block.find(label) != -1]
+    if end_positions:
+        block = block[: min(end_positions)]
+    return block.strip()
+
+
+def _extract_product_aliases(normalized_text: str) -> tuple[str, list[str], dict[str, str]]:
+    aliases_block = _extract_product_text_block(normalized_text, "PART NUMBER(S)", ("OVERVIEW:", "SPECIFICATIONS:"))
+    alias_attributes: dict[str, str] = {}
+    aliases: list[str] = []
+    primary_part = ""
+    for label, attribute_name in PRODUCT_ATTRIBUTE_LABELS.items():
+        if "PART#" not in label and label != "MODEL#":
+            continue
+        match = re.search(label + r"\s+([A-Z0-9-]+)", aliases_block)
+        if match is None:
+            continue
+        value = match.group(1).strip()
+        alias_attributes[attribute_name] = value
+        if attribute_name == "option_part_number":
+            primary_part = value
+        else:
+            aliases.append(value)
+
+    if primary_part:
+        aliases.append(primary_part)
+
+    seen: set[str] = set()
+    deduped_aliases: list[str] = []
+    for alias in aliases:
+        normalized = normalize_part_number(alias)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_aliases.append(alias)
+
+    return primary_part, deduped_aliases, alias_attributes
+
+
+def _extract_product_specifications(normalized_text: str) -> dict[str, str]:
+    specs_block = _extract_product_text_block(normalized_text, "SPECIFICATIONS:", ("REPLACEMENT INSTRUCTIONS", "PART#", "QUANTITY:", "OTHER CONDITIONS:"))
+    attributes: dict[str, str] = {}
+    for label, attribute_name in PRODUCT_ATTRIBUTE_LABELS.items():
+        if label in {"OPTION PART#", "SMARTBUY PART#", "SPARE PART#", "ASSEMBLY PART#", "MODEL#"}:
+            continue
+        match = re.search(label + r"\s+(.+?)(?=(?:" + "|".join(re.escape(candidate) for candidate in PRODUCT_ATTRIBUTE_LABELS.keys()) + r")\s|$)", specs_block)
+        if match is None:
+            continue
+        attributes[attribute_name] = match.group(1).strip()
+    return attributes
+
+
+def parse_harddrivesdirect_product_page(html: str, page_url: str) -> dict[str, object] | None:
+    soup = BeautifulSoup(html, "html.parser")
+    title_candidates = [soup.title.get_text(" ", strip=True) if soup.title else ""]
+    heading = soup.find(["h1", "h2"])
+    if heading is not None:
+        title_candidates.append(heading.get_text(" ", strip=True))
+    title = next((candidate.strip() for candidate in title_candidates if candidate and candidate.strip()), "")
+
+    normalized_text = normalize_text(soup.get_text(" ", strip=True))
+    if "SPECIFICATIONS:" not in normalized_text or "PART NUMBER(S)" not in normalized_text:
+        return None
+
+    primary_part, aliases, alias_attributes = _extract_product_aliases(normalized_text)
+    if not primary_part:
+        part_match = PART_NUMBER_PATTERN.search(normalized_text)
+        if part_match is None:
+            return None
+        primary_part = part_match.group(0)
+
+    description_block = _extract_product_text_block(normalized_text, "DESCRIPTION:", ("PART NUMBER(S)", "OVERVIEW:"))
+    description = description_block or normalize_text(title)
+    attributes = alias_attributes
+    attributes.update(_extract_product_specifications(normalized_text))
+    page_models = extract_harddrivesdirect_page_models(html)
+    if not page_models:
+        compatibility_block = _extract_product_text_block(normalized_text, "THIS HP PART#", ("FLAT RATE SHIPPING OPTIONS", "OTHER IN STOCK", "SHOPPERAPPROVED"))
+        page_models = extract_candidate_models(compatibility_block)
+
+    manufacturer = "HPE" if any(token in description for token in ("HP ", "HPE", "PROLIANT")) else ""
+    product_url = page_url
+    return {
+        "part_number": primary_part,
+        "description": description,
+        "manufacturer": manufacturer,
+        "product_url": product_url,
+        "source_title": normalize_text(title) or description,
+        "system_models": page_models,
+        "aliases": aliases,
+        "attributes": attributes,
+    }
 
 
 def extract_harddrivesdirect_listing_links(html: str, page_url: str) -> list[str]:
@@ -507,7 +675,7 @@ def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
     normalized_text = normalize_text(soup.get_text(" ", strip=True))
     listing_rows = parse_harddrivesdirect_listing(html, page_url)
     search_rows = parse_harddrivesdirect_search_results(html, page_url)
-    rows = listing_rows or search_rows
+    product_row = parse_harddrivesdirect_product_page(html, page_url)
     listing_links = extract_harddrivesdirect_listing_links(html, page_url)
     detected_models = extract_harddrivesdirect_page_models(html) or extract_candidate_models(page_title)
 
@@ -529,6 +697,16 @@ def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
             listing_links=listing_links,
             detected_models=detected_models,
             guidance="This page contains product search results with page-level compatibility context and can be imported.",
+        )
+
+    if product_row is not None:
+        return ReferenceHtmlAnalysis(
+            page_kind="product_detail",
+            page_title=page_title,
+            rows_detected=1,
+            listing_links=listing_links,
+            detected_models=detected_models or [str(model) for model in product_row.get("system_models", [])],
+            guidance="This page contains one detailed product record with aliases and specifications and can be imported.",
         )
 
     if listing_links:
@@ -593,7 +771,7 @@ def import_reference_html(
             "This saved HTML looks like a model-specific or category-specific page, but no direct part rows were detected. "
             "Inspect the saved page structure before importing it."
         )
-    if analysis.page_kind not in {"direct_listing", "search_results_listing"}:
+    if analysis.page_kind not in {"direct_listing", "search_results_listing", "product_detail"}:
         raise RuntimeError("The saved HTML could not be recognized as an importable listing page.")
 
     return import_reference_rows(
