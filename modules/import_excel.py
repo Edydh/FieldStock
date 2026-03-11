@@ -14,11 +14,14 @@ from modules.utils import safe_float
 DEFAULT_COLUMN_MAP = {
     "part_number": "Product identification",
     "description": "Product name",
+    "manufacturer": "OEM",
     "warehouse": "Warehouse",
     "location_code": "Location",
     "uom": "Inventory unit",
     "quantity": "Total available",
 }
+
+OPTIONAL_COLUMN_KEYS = {"manufacturer"}
 
 
 @dataclass
@@ -38,15 +41,26 @@ def read_excel_preview(file_bytes: bytes, max_rows: int = 20) -> tuple[pd.DataFr
 def _prepare_dataframe(file_bytes: bytes, column_map: dict[str, str]) -> pd.DataFrame:
     dataframe = pd.read_excel(BytesIO(file_bytes))
     dataframe = dataframe.fillna("")
-    missing_columns = [source for source in column_map.values() if source not in dataframe.columns]
+    missing_columns = [
+        source
+        for key, source in column_map.items()
+        if key not in OPTIONAL_COLUMN_KEYS and source not in dataframe.columns
+    ]
     if missing_columns:
         joined = ", ".join(missing_columns)
         raise ValueError(f"Missing expected columns: {joined}")
+
+    manufacturer_source = column_map.get("manufacturer", "")
+    if manufacturer_source and manufacturer_source in dataframe.columns:
+        manufacturer_series = dataframe[manufacturer_source].astype(str).str.strip()
+    else:
+        manufacturer_series = pd.Series("", index=dataframe.index, dtype="object")
 
     prepared = pd.DataFrame(
         {
             "part_number": dataframe[column_map["part_number"]].astype(str).str.strip(),
             "description": dataframe[column_map["description"]].astype(str).str.strip(),
+            "manufacturer": manufacturer_series,
             "warehouse": dataframe[column_map["warehouse"]].astype(str).str.strip(),
             "location_code": dataframe[column_map["location_code"]].astype(str).str.strip(),
             "uom": dataframe[column_map["uom"]].astype(str).str.strip(),
@@ -59,7 +73,7 @@ def _prepare_dataframe(file_bytes: bytes, column_map: dict[str, str]) -> pd.Data
     prepared["quantity"] = prepared["quantity"].apply(safe_float)
 
     grouped = (
-        prepared.groupby(["part_number", "description", "warehouse", "location_code", "uom"], dropna=False)[
+        prepared.groupby(["part_number", "description", "manufacturer", "warehouse", "location_code", "uom"], dropna=False)[
             "quantity"
         ]
         .sum()
@@ -85,6 +99,7 @@ def import_snapshot(
                 conn=conn,
                 part_number=row.part_number,
                 description=row.description,
+                manufacturer=row.manufacturer,
                 uom=row.uom,
             )
             location_id = upsert_location(

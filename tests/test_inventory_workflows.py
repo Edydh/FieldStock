@@ -232,6 +232,7 @@ def test_search_inventory_matches_normalized_part_number(conn: sqlite3.Connectio
             {
                 "Product identification": "P-100-A",
                 "Product name": "Drive 300GB",
+                "OEM": "Seagate",
                 "Warehouse": "Main",
                 "Location": "A1",
                 "Inventory unit": "EA",
@@ -251,6 +252,42 @@ def test_search_inventory_matches_normalized_part_number(conn: sqlite3.Connectio
 
     assert len(rows) == 1
     assert rows[0]["part_number"] == "P-100-A"
+    assert rows[0]["oem"] == "Seagate"
+
+
+def test_snapshot_import_stores_oem_in_search_results(conn: sqlite3.Connection) -> None:
+    file_bytes = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-500",
+                "Product name": "SSD 960GB",
+                "OEM": "Samsung",
+                "Warehouse": "Main",
+                "Location": "D4",
+                "Inventory unit": "EA",
+                "Total available": 6,
+            }
+        ]
+    )
+
+    import_snapshot(
+        conn=conn,
+        file_bytes=file_bytes,
+        column_map=None,
+        created_by="tester",
+        reference="import-001",
+    )
+
+    row = conn.execute(
+        "SELECT manufacturer FROM parts WHERE part_number = ?",
+        ("P-500",),
+    ).fetchone()
+    rows = search_inventory(conn, query="P-500", available_only=True)
+
+    assert row is not None
+    assert row["manufacturer"] == "Samsung"
+    assert len(rows) == 1
+    assert rows[0]["oem"] == "Samsung"
 
 
 def test_search_inventory_available_only_filters_zero_stock(conn: sqlite3.Connection) -> None:

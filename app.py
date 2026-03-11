@@ -41,9 +41,10 @@ with import_tab:
 
     uploaded_file = st.file_uploader("Inventory Excel file", type=["xlsx", "xlsm", "xls"])
 
+    column_labels = {"manufacturer": "OEM"}
     column_map = {}
     for key, default_value in DEFAULT_COLUMN_MAP.items():
-        label = key.replace("_", " ").title()
+        label = column_labels.get(key, key.replace("_", " ").title())
         column_map[key] = st.text_input(label, value=default_value)
 
     if uploaded_file is not None:
@@ -94,7 +95,8 @@ with search_tab:
         transactions = recent_transactions(conn)
 
     if rows:
-        st.dataframe(pd.DataFrame([dict(row) for row in rows]), use_container_width=True)
+        search_results_df = pd.DataFrame([dict(row) for row in rows]).rename(columns={"oem": "OEM"})
+        st.dataframe(search_results_df, use_container_width=True)
     else:
         st.info("No inventory rows matched the current search.")
 
@@ -132,7 +134,7 @@ with adjustment_tab:
         def format_adjustment_option(option: dict[str, object]) -> str:
             return (
                 f"{option['part_number']} | {option['warehouse_code']} / {option['location_code']} | "
-                f"Qty {float(option['qty_on_hand']):.2f} | {option['description']}"
+                f"Qty {float(option['qty_on_hand']):.2f} | {option['oem']} | {option['description']}"
             )
 
         selected_option = st.selectbox(
@@ -143,8 +145,8 @@ with adjustment_tab:
 
         st.dataframe(
             pd.DataFrame(adjustment_options)[
-                ["part_number", "description", "warehouse_code", "location_code", "qty_on_hand", "uom", "updated_at"]
-            ],
+                ["part_number", "description", "oem", "warehouse_code", "location_code", "qty_on_hand", "uom", "updated_at"]
+            ].rename(columns={"oem": "OEM"}),
             use_container_width=True,
         )
 

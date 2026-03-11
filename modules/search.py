@@ -42,6 +42,7 @@ def search_inventory(
         SELECT
             p.part_number,
             p.description,
+            p.manufacturer AS oem,
             p.uom,
             l.warehouse_code,
             l.location_code,
@@ -74,6 +75,7 @@ def search_inventory_records(
             l.id AS location_id,
             p.part_number,
             p.description,
+            p.manufacturer AS oem,
             p.uom,
             l.warehouse_code,
             l.location_code,
