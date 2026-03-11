@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment
-from modules.import_excel import analyze_snapshot_import, import_snapshot, summarize_import
+from modules.import_excel import analyze_snapshot_import, import_snapshot, recent_import_runs, summarize_import
 from modules.search import search_inventory
 
 
@@ -78,6 +78,9 @@ def test_snapshot_import_creates_balances_and_transactions(conn: sqlite3.Connect
         ("P-100", "MAIN", "A1"),
     ).fetchone()
     transaction_count = conn.execute("SELECT COUNT(*) AS count FROM inventory_transactions").fetchone()["count"]
+    import_run = conn.execute(
+        "SELECT reference, created_by, rows_read, rows_imported, balances_zeroed FROM import_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
 
     assert result.rows_read == 1
     assert result.rows_imported == 1
@@ -85,6 +88,12 @@ def test_snapshot_import_creates_balances_and_transactions(conn: sqlite3.Connect
     assert balance is not None
     assert float(balance["qty_on_hand"]) == 5.0
     assert transaction_count == 1
+    assert import_run is not None
+    assert import_run["reference"] == "import-001"
+    assert import_run["created_by"] == "tester"
+    assert import_run["rows_read"] == 1
+    assert import_run["rows_imported"] == 1
+    assert import_run["balances_zeroed"] == 0
 
 
 def test_snapshot_import_zeroes_missing_balances(conn: sqlite3.Connection) -> None:
@@ -380,6 +389,133 @@ def test_analyze_snapshot_import_counts_unchanged_balances(conn: sqlite3.Connect
     assert impact.updated_balances == 0
     assert impact.unchanged_balances == 1
     assert impact.balances_to_zero == 0
+
+
+def test_recent_import_runs_returns_latest_runs_first(conn: sqlite3.Connection) -> None:
+    first_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            }
+        ]
+    )
+    second_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-200",
+                "Product name": "Drive 600GB",
+                "Warehouse": "Main",
+                "Location": "B2",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            }
+        ]
+    )
+
+    import_snapshot(
+        conn=conn,
+        file_bytes=first_file,
+        column_map=None,
+        created_by="tester-a",
+        reference="import-001",
+        source_filename="first.xlsx",
+    )
+    import_snapshot(
+        conn=conn,
+        file_bytes=second_file,
+        column_map=None,
+        created_by="tester-b",
+        reference="import-002",
+        source_filename="second.xlsx",
+    )
+
+    runs = recent_import_runs(conn)
+
+    assert len(runs) == 2
+    assert runs[0]["reference"] == "import-002"
+    assert runs[0]["created_by"] == "tester-b"
+    assert runs[0]["source_filename"] == "second.xlsx"
+    assert runs[0]["rows_imported"] == 1
+    assert runs[0]["balances_zeroed"] == 1
+    assert runs[1]["reference"] == "import-001"
+
+
+def test_recent_import_runs_filters_by_reference(conn: sqlite3.Connection) -> None:
+    first_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            }
+        ]
+    )
+    second_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-200",
+                "Product name": "Drive 600GB",
+                "Warehouse": "Main",
+                "Location": "B2",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            }
+        ]
+    )
+
+    import_snapshot(conn=conn, file_bytes=first_file, column_map=None, created_by="tester", reference="cycle-001")
+    import_snapshot(conn=conn, file_bytes=second_file, column_map=None, created_by="tester", reference="month-end-002")
+
+    runs = recent_import_runs(conn, reference_query="month-end")
+
+    assert len(runs) == 1
+    assert runs[0]["reference"] == "month-end-002"
+
+
+def test_recent_import_runs_filters_by_date_range(conn: sqlite3.Connection) -> None:
+    first_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            }
+        ]
+    )
+    second_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-200",
+                "Product name": "Drive 600GB",
+                "Warehouse": "Main",
+                "Location": "B2",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            }
+        ]
+    )
+
+    import_snapshot(conn=conn, file_bytes=first_file, column_map=None, created_by="tester", reference="import-001")
+    import_snapshot(conn=conn, file_bytes=second_file, column_map=None, created_by="tester", reference="import-002")
+
+    conn.execute("UPDATE import_runs SET created_at = ? WHERE reference = ?", ("2026-03-01 09:00:00", "import-001"))
+    conn.execute("UPDATE import_runs SET created_at = ? WHERE reference = ?", ("2026-03-10 18:30:00", "import-002"))
+
+    runs = recent_import_runs(conn, created_at_from="2026-03-05", created_at_to="2026-03-11")
+
+    assert len(runs) == 1
+    assert runs[0]["reference"] == "import-002"
 
 
 def test_search_inventory_available_only_filters_zero_stock(conn: sqlite3.Connection) -> None:

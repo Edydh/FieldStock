@@ -1,25 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
-from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, summarize_import
+from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, recent_import_runs, summarize_import
 from modules.search import recent_transactions, search_inventory, search_inventory_records
 
 
 st.set_page_config(page_title="FieldStock", page_icon="F", layout="wide")
 
 
-@st.cache_resource
-def setup_database() -> bool:
-    initialize_database()
-    return True
-
-
-setup_database()
+initialize_database()
 
 st.title("FieldStock")
 st.caption("Local inventory and compatibility assistant")
@@ -101,6 +95,7 @@ with import_tab:
                             column_map=column_map,
                             created_by=operator_name.strip() or "system",
                             reference=reference.strip() or "snapshot-import",
+                            source_filename=uploaded_file.name,
                         )
                 except Exception as exc:
                     st.error(f"Import failed: {exc}")
@@ -109,6 +104,56 @@ with import_tab:
                         "Snapshot import completed. "
                         f"Imported {result.rows_imported} rows and zeroed {result.balances_zeroed} balances missing from the file."
                     )
+
+    st.subheader("Recent Import Runs")
+    import_filter_columns = st.columns([2, 1, 1])
+    import_reference_filter = import_filter_columns[0].text_input(
+        "Filter by reference",
+        placeholder="Search import reference",
+        key="import_reference_filter",
+    )
+    use_import_date_filter = import_filter_columns[1].checkbox(
+        "Use date filter",
+        value=False,
+        key="use_import_date_filter",
+    )
+    import_limit = int(
+        import_filter_columns[2].selectbox(
+            "Rows",
+            options=[10, 20, 50, 100],
+            index=1,
+            key="import_runs_limit",
+        )
+    )
+
+    import_date_from = None
+    import_date_to = None
+    if use_import_date_filter:
+        date_columns = st.columns(2)
+        import_date_from = date_columns[0].date_input(
+            "From date",
+            value=datetime.now().date() - timedelta(days=30),
+            key="import_date_from",
+        )
+        import_date_to = date_columns[1].date_input(
+            "To date",
+            value=datetime.now().date(),
+            key="import_date_to",
+        )
+
+    with get_connection() as conn:
+        import_runs = recent_import_runs(
+            conn,
+            limit=import_limit,
+            reference_query=import_reference_filter,
+            created_at_from=import_date_from,
+            created_at_to=import_date_to,
+        )
+
+    if import_runs:
+        st.dataframe(pd.DataFrame([dict(row) for row in import_runs]), use_container_width=True)
+    else:
+        st.info("No snapshot imports matched the current filters.")
 
 with search_tab:
     st.subheader("Inventory Search")

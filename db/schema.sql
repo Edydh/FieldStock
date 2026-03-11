@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
     FOREIGN KEY(location_id) REFERENCES locations(id)
 );
 
+CREATE TABLE IF NOT EXISTS import_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference TEXT NOT NULL,
+    created_by TEXT,
+    source_filename TEXT,
+    rows_read INTEGER NOT NULL DEFAULT 0,
+    rows_imported INTEGER NOT NULL DEFAULT 0,
+    balances_zeroed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS parts_fts USING fts5(
     part_number,
     description,
@@ -81,3 +92,4 @@ CREATE INDEX IF NOT EXISTS idx_inventory_balances_location_id ON inventory_balan
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_part_id ON inventory_transactions(part_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_location_id ON inventory_transactions(location_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_created_at ON inventory_transactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_import_runs_created_at ON import_runs(created_at);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from io import BytesIO
 from typing import Any
 
@@ -40,6 +41,37 @@ class ImportImpactResult:
     balances_to_zero: int
     balance_change_preview: list[dict[str, Any]]
     zero_balance_preview: list[dict[str, Any]]
+
+
+def _record_import_run(
+    conn: sqlite3.Connection,
+    reference: str,
+    created_by: str,
+    source_filename: str,
+    rows_read: int,
+    rows_imported: int,
+    balances_zeroed: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO import_runs (
+            reference,
+            created_by,
+            source_filename,
+            rows_read,
+            rows_imported,
+            balances_zeroed
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            reference,
+            created_by,
+            source_filename,
+            rows_read,
+            rows_imported,
+            balances_zeroed,
+        ),
+    )
 
 
 def read_excel_preview(file_bytes: bytes, max_rows: int = 20) -> tuple[pd.DataFrame, list[str]]:
@@ -99,6 +131,7 @@ def import_snapshot(
     column_map: dict[str, str] | None,
     created_by: str,
     reference: str,
+    source_filename: str = "",
 ) -> ImportResult:
     mapping = column_map or DEFAULT_COLUMN_MAP
     prepared = _prepare_dataframe(file_bytes, mapping)
@@ -133,6 +166,16 @@ def import_snapshot(
             valid_keys=imported_keys,
             created_by=created_by,
             reference=reference,
+        )
+
+        _record_import_run(
+            conn=conn,
+            reference=reference,
+            created_by=created_by,
+            source_filename=source_filename,
+            rows_read=len(prepared.index),
+            rows_imported=len(prepared.index),
+            balances_zeroed=zeroed,
         )
 
     return ImportResult(
@@ -258,6 +301,51 @@ def analyze_snapshot_import(
         balance_change_preview=balance_change_preview,
         zero_balance_preview=zero_balance_preview,
     )
+
+
+def recent_import_runs(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    reference_query: str = "",
+    created_at_from: date | str | None = None,
+    created_at_to: date | str | None = None,
+) -> list[sqlite3.Row]:
+    where_clauses: list[str] = []
+    params: list[object] = []
+
+    cleaned_reference = reference_query.strip()
+    if cleaned_reference:
+        where_clauses.append("reference LIKE ?")
+        params.append(f"%{cleaned_reference}%")
+
+    if created_at_from is not None:
+        where_clauses.append("date(created_at) >= date(?)")
+        params.append(str(created_at_from))
+
+    if created_at_to is not None:
+        where_clauses.append("date(created_at) <= date(?)")
+        params.append(str(created_at_to))
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    params.append(limit)
+
+    return conn.execute(
+        f"""
+        SELECT
+            created_at,
+            reference,
+            created_by,
+            source_filename,
+            rows_read,
+            rows_imported,
+            balances_zeroed
+        FROM import_runs
+        {where_sql}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
 
 
 def summarize_import(file_bytes: bytes, column_map: dict[str, str] | None = None) -> dict[str, Any]:
