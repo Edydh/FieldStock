@@ -553,3 +553,27 @@ def compatibility_reference_summary(conn: sqlite3.Connection) -> sqlite3.Row:
             (SELECT COUNT(*) FROM reference_sources) AS sources
         """
     ).fetchone()
+
+
+def compatibility_source_summary(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            rs.id,
+            rs.source_name,
+            rs.source_type,
+            rs.source_url,
+            rs.created_at,
+            rs.updated_at,
+            COUNT(DISTINCT rp.id) AS reference_part_count,
+            COUNT(DISTINCT spc.id) AS compatibility_count,
+            COUNT(DISTINCT sm.id) AS system_model_count,
+            COALESCE(GROUP_CONCAT(DISTINCT NULLIF(sm.manufacturer, '')), '') AS manufacturers
+        FROM reference_sources rs
+        LEFT JOIN reference_parts rp ON rp.source_id = rs.id
+        LEFT JOIN system_part_compatibility spc ON spc.source_id = rs.id
+        LEFT JOIN system_models sm ON sm.id = spc.system_model_id
+        GROUP BY rs.id, rs.source_name, rs.source_type, rs.source_url, rs.created_at, rs.updated_at
+        ORDER BY rs.updated_at DESC, rs.id DESC
+        """
+    ).fetchall()

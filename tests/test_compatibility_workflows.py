@@ -7,8 +7,8 @@ import pytest
 import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import extract_candidate_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing
-from modules.reference_search import compatibility_inventory_for_model, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
+from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing
+from modules.reference_search import compatibility_inventory_for_model, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
 def make_connection() -> sqlite3.Connection:
@@ -54,6 +54,80 @@ def test_import_reference_rows_creates_models_and_compatibility(conn: sqlite3.Co
     assert len(models) == 1
     assert models[0]["model_name"] == "G8 G9"
     assert models[0]["compatible_part_count"] == 1
+
+
+def test_import_reference_rows_reuses_existing_source_for_same_url(conn: sqlite3.Connection) -> None:
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872737-001", "872737001"],
+            }
+        ],
+        source_name="HardDrivesDirect HP",
+        source_type="saved_html",
+        source_url="https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
+    )
+
+    result = import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872737-001", "872737001"],
+            }
+        ],
+        source_name="Renamed HP Source",
+        source_type="saved_html",
+        source_url="https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
+    )
+
+    source_count = conn.execute("SELECT COUNT(*) FROM reference_sources").fetchone()[0]
+    part_count = conn.execute("SELECT COUNT(*) FROM reference_parts").fetchone()[0]
+    compatibility_count = conn.execute("SELECT COUNT(*) FROM system_part_compatibility").fetchone()[0]
+    source_name = conn.execute("SELECT source_name FROM reference_sources").fetchone()[0]
+
+    assert result.parts_upserted == 0
+    assert result.compatibilities_upserted == 0
+    assert source_count == 1
+    assert part_count == 1
+    assert compatibility_count == 1
+    assert source_name == "Renamed HP Source"
+
+
+def test_compatibility_source_summary_groups_by_source(conn: sqlite3.Connection) -> None:
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872737-001", "872737001"],
+            }
+        ],
+        source_name="HardDrivesDirect HP",
+        source_type="saved_html",
+        source_url="https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
+    )
+
+    rows = compatibility_source_summary(conn)
+
+    assert rows
+    assert rows[0]["source_name"] == "HardDrivesDirect HP"
+    assert rows[0]["source_type"] == "saved_html"
+    assert rows[0]["source_url"] == "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php"
+    assert int(rows[0]["reference_part_count"]) == 1
+    assert int(rows[0]["system_model_count"]) == 1
+    assert "HPE" in rows[0]["manufacturers"]
 
 
 def test_compatibility_search_matches_local_inventory_by_alias(conn: sqlite3.Connection) -> None:
@@ -246,9 +320,29 @@ def test_parse_harddrivesdirect_listing_extracts_rows_and_models() -> None:
     assert "DL560 G9" in rows[1]["system_models"]
 
 
-def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:
+def test_extract_harddrivesdirect_listing_links_finds_listing_pages() -> None:
         html = """
         <html>
+                <body>
+                        <a href="HTML_HP_SAS_SATA_1.php">HP page 1</a>
+                        <a href="HTML_Dell_SAS_SATA_1.php">Dell page 1</a>
+                        <a href="proliant_configuration.php">Configuration</a>
+                </body>
+        </html>
+        """
+
+        links = extract_harddrivesdirect_listing_links(html, "https://www.harddrivesdirect.com/proliant_configuration.php")
+
+        assert links == [
+                "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
+                "https://www.harddrivesdirect.com/HTML_Dell_SAS_SATA_1.php",
+        ]
+
+
+def test_analyze_reference_html_classifies_direct_listing() -> None:
+        html = """
+        <html>
+            <head><title>HP SAS SATA Listing</title></head>
             <body>
                 <table>
                     <tr><th>Product Name</th><th>Part#</th></tr>
@@ -261,32 +355,107 @@ def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -
         </html>
         """
 
-        result = import_reference_html(
-                conn,
-                html=html,
-                page_url="https://example.test/hp",
-                source_name="Saved Page",
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php")
+
+        assert isinstance(analysis, ReferenceHtmlAnalysis)
+        assert analysis.page_kind == "direct_listing"
+        assert analysis.rows_detected == 1
+
+
+def test_analyze_reference_html_classifies_configuration_page() -> None:
+        html = """
+        <html>
+            <head><title>HP Proliant Options</title></head>
+            <body>
+                <a href="HTML_HP_SAS_SATA_1.php">HP page 1</a>
+                <a href="HTML_Dell_SAS_SATA_1.php">Dell page 1</a>
+            </body>
+        </html>
+        """
+
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/proliant_configuration.php")
+
+        assert analysis.page_kind == "configuration_index"
+        assert len(analysis.listing_links) == 2
+
+
+def test_analyze_reference_html_classifies_model_category_page() -> None:
+        html = """
+        <html>
+            <head><title>DL20 G9 Hard Drives</title></head>
+            <body>
+                <h1>Proliant DL20 G9 Hard Drives</h1>
+                <p>Server options and hard drives for DL20 G9.</p>
+            </body>
+        </html>
+        """
+
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/proliant_build_DL20_G9_Hard_Drives.php")
+
+        assert analysis.page_kind == "model_category_unknown"
+        assert "DL20 G9" in analysis.detected_models
+
+
+def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:
+    html = """
+    <html>
+        <body>
+            <table>
+                <tr><th>Product Name</th><th>Part#</th></tr>
+                <tr>
+                    <td><a href="product_info.php?products_id=1">872737-001 HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC</a></td>
+                    <td>872737-001</td>
+                </tr>
+            </table>
+        </body>
+    </html>
+    """
+
+    result = import_reference_html(
+        conn,
+        html=html,
+        page_url="https://example.test/hp",
+        source_name="Saved Page",
+    )
+
+    models = search_system_models(conn, "G8 G9")
+
+    assert result.rows_seen == 1
+    assert result.parts_upserted == 1
+    assert result.compatibilities_upserted == 1
+    assert len(models) == 1
+
+
+def test_import_reference_html_rejects_configuration_page_with_listing_hints(conn: sqlite3.Connection) -> None:
+    html = """
+    <html>
+      <body>
+        <a href="HTML_HP_SAS_SATA_1.php">HP page 1</a>
+        <a href="HTML_Dell_SAS_SATA_1.php">Dell page 1</a>
+      </body>
+    </html>
+    """
+
+    with pytest.raises(RuntimeError, match="configuration or index page"):
+        import_reference_html(
+            conn,
+            html=html,
+            page_url="https://www.harddrivesdirect.com/proliant_configuration.php",
+            source_name="Saved Config Page",
         )
-
-        models = search_system_models(conn, "G8 G9")
-
-        assert result.rows_seen == 1
-        assert result.parts_upserted == 1
-        assert result.compatibilities_upserted == 1
-        assert len(models) == 1
 
 
 def test_import_reference_url_returns_actionable_error_on_403(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(*args: object, **kwargs: object) -> requests.Response:
-                response = requests.Response()
-                response.status_code = 403
-                response.url = "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php"
-                raise requests.HTTPError(response=response)
+    def fake_get(*args: object, **kwargs: object) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 403
+        response.url = "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php"
+        raise requests.HTTPError(response=response)
 
-        monkeypatch.setattr("modules.reference_import.requests.get", fake_get)
+    monkeypatch.setattr("modules.reference_import.requests.get", fake_get)
 
-        with pytest.raises(RuntimeError, match="save it as an HTML file"):
-                import_reference_url(conn, "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php")
+    with pytest.raises(RuntimeError, match="save it as an HTML file"):
+        import_reference_url(conn, "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php")
 
 
 def test_extract_candidate_models_handles_common_patterns() -> None:

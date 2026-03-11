@@ -46,6 +46,16 @@ class ReferenceImportResult:
     compatibilities_upserted: int
 
 
+@dataclass(slots=True)
+class ReferenceHtmlAnalysis:
+    page_kind: str
+    page_title: str
+    rows_detected: int
+    listing_links: list[str]
+    detected_models: list[str]
+    guidance: str
+
+
 def extract_candidate_models(product_name: str) -> list[str]:
     cleaned = normalize_text(product_name)
     matches: list[str] = []
@@ -82,6 +92,27 @@ def _upsert_reference_source(
     source_url: str,
 ) -> int:
     cleaned_url = source_url.strip()
+    existing_by_url = None
+    if cleaned_url:
+        existing_by_url = conn.execute(
+            """
+            SELECT id
+            FROM reference_sources
+            WHERE source_type = ? AND source_url = ?
+            """,
+            (source_type.strip(), cleaned_url),
+        ).fetchone()
+    if existing_by_url is not None:
+        conn.execute(
+            """
+            UPDATE reference_sources
+            SET source_name = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (source_name.strip(), int(existing_by_url["id"])),
+        )
+        return int(existing_by_url["id"])
+
     conn.execute(
         """
         INSERT INTO reference_sources (source_name, source_type, source_url)
@@ -360,6 +391,98 @@ def parse_harddrivesdirect_listing(html: str, page_url: str) -> list[dict[str, o
     return rows
 
 
+def extract_harddrivesdirect_listing_links(html: str, page_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"].strip()
+        if not href:
+            continue
+        absolute_url = urljoin(page_url, href)
+        normalized_url = absolute_url.upper()
+        if "HARDDRIVESDIRECT.COM" not in normalized_url:
+            continue
+        if "HTML_" not in normalized_url:
+            continue
+        if "SAS_SATA" not in normalized_url and "SSD" not in normalized_url and "NVME" not in normalized_url:
+            continue
+        if absolute_url in seen:
+            continue
+        seen.add(absolute_url)
+        links.append(absolute_url)
+
+    return links
+
+
+def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
+    soup = BeautifulSoup(html, "html.parser")
+    title_candidates = [
+        soup.title.get_text(" ", strip=True) if soup.title else "",
+    ]
+    heading = soup.find(["h1", "h2"])
+    if heading is not None:
+        title_candidates.append(heading.get_text(" ", strip=True))
+
+    page_title = next((candidate.strip() for candidate in title_candidates if candidate and candidate.strip()), page_url)
+    normalized_text = normalize_text(soup.get_text(" ", strip=True))
+    rows = parse_harddrivesdirect_listing(html, page_url)
+    listing_links = extract_harddrivesdirect_listing_links(html, page_url)
+    detected_models = extract_candidate_models(page_title)
+
+    if rows:
+        return ReferenceHtmlAnalysis(
+            page_kind="direct_listing",
+            page_title=page_title,
+            rows_detected=len(rows),
+            listing_links=listing_links,
+            detected_models=detected_models,
+            guidance="This page contains direct part rows and can be imported.",
+        )
+
+    if listing_links:
+        return ReferenceHtmlAnalysis(
+            page_kind="configuration_index",
+            page_title=page_title,
+            rows_detected=0,
+            listing_links=listing_links,
+            detected_models=detected_models,
+            guidance="This page looks like a configuration or index page. Import one of the linked listing pages instead.",
+        )
+
+    model_page_tokens = (
+        "OPTIONS",
+        "HARD DRIVES",
+        "SOLID STATE DRIVES",
+        "POWER SUPPLIES",
+        "CONTROLLERS",
+        "MEMORY",
+        "PROCESSORS",
+    )
+    if (
+        any(token in normalized_text for token in model_page_tokens)
+        and ("PROLIANT" in normalized_text or bool(detected_models))
+    ):
+        return ReferenceHtmlAnalysis(
+            page_kind="model_category_unknown",
+            page_title=page_title,
+            rows_detected=0,
+            listing_links=[],
+            detected_models=detected_models,
+            guidance="This page looks model-specific, but no direct part rows were detected in the saved HTML.",
+        )
+
+    return ReferenceHtmlAnalysis(
+        page_kind="unknown",
+        page_title=page_title,
+        rows_detected=0,
+        listing_links=listing_links,
+        detected_models=detected_models,
+        guidance="The saved HTML could not be recognized as an importable listing page.",
+    )
+
+
 def import_reference_html(
     conn: sqlite3.Connection,
     html: str,
@@ -367,7 +490,22 @@ def import_reference_html(
     source_name: str = "HardDrivesDirect",
     source_type: str = "saved_html",
 ) -> ReferenceImportResult:
+    analysis = analyze_reference_html(html, page_url)
     rows = parse_harddrivesdirect_listing(html, page_url)
+    if analysis.page_kind == "configuration_index":
+        preview_links = ", ".join(analysis.listing_links[:5])
+        raise RuntimeError(
+            "This saved HTML looks like a HardDrivesDirect configuration or index page, not a direct parts listing. "
+            f"Import one of the linked listing pages instead. Examples: {preview_links}"
+        )
+    if analysis.page_kind == "model_category_unknown":
+        raise RuntimeError(
+            "This saved HTML looks like a model-specific or category-specific page, but no direct part rows were detected. "
+            "Inspect the saved page structure before importing it."
+        )
+    if analysis.page_kind != "direct_listing":
+        raise RuntimeError("The saved HTML could not be recognized as an importable listing page.")
+
     return import_reference_rows(
         conn,
         rows=rows,

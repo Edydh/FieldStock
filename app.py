@@ -7,8 +7,8 @@ import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, recent_import_runs, summarize_import
-from modules.reference_import import import_reference_html, import_reference_rows, import_reference_url
-from modules.reference_search import compatibility_reference_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
+from modules.reference_import import analyze_reference_html, import_reference_html, import_reference_rows, import_reference_url
+from modules.reference_search import compatibility_reference_summary, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 from modules.search import recent_transactions, search_inventory, search_inventory_records, transactions_for_import_run
 
 
@@ -263,12 +263,34 @@ with compatibility_tab:
 
     with get_connection() as conn:
         reference_summary = compatibility_reference_summary(conn)
+        source_rows = compatibility_source_summary(conn)
 
     summary_columns = st.columns(4)
     summary_columns[0].metric("System Models", int(reference_summary["system_models"]))
     summary_columns[1].metric("Reference Parts", int(reference_summary["reference_parts"]))
     summary_columns[2].metric("Compatibilities", int(reference_summary["compatibilities"]))
     summary_columns[3].metric("Sources", int(reference_summary["sources"]))
+
+    st.markdown("#### Imported Sources")
+    if source_rows:
+        source_df = pd.DataFrame(
+            [
+                {
+                    "source_name": row["source_name"],
+                    "source_type": row["source_type"],
+                    "source_url": row["source_url"],
+                    "reference_parts": int(row["reference_part_count"]),
+                    "system_models": int(row["system_model_count"]),
+                    "compatibilities": int(row["compatibility_count"]),
+                    "manufacturers": row["manufacturers"] or "Unknown",
+                    "updated_at": row["updated_at"],
+                }
+                for row in source_rows
+            ]
+        )
+        st.dataframe(source_df, use_container_width=True)
+    else:
+        st.info("No compatibility reference sources have been imported yet.")
 
     if int(reference_summary["system_models"]) == 0:
         st.warning(
@@ -354,18 +376,42 @@ with compatibility_tab:
         type=["html", "htm"],
         key="compatibility_saved_html",
     )
+    saved_html_text = ""
+    saved_html_analysis = None
+    if saved_html_file is not None:
+        html_bytes = saved_html_file.getvalue()
+        try:
+            saved_html_text = html_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            saved_html_text = html_bytes.decode("latin-1")
+
+        saved_html_analysis = analyze_reference_html(
+            saved_html_text,
+            reference_url.strip() or saved_html_file.name,
+        )
+
+        st.write("Saved HTML analysis:")
+        analysis_columns = st.columns(4)
+        analysis_columns[0].metric("Page type", saved_html_analysis.page_kind.replace("_", " ").title())
+        analysis_columns[1].metric("Detected rows", saved_html_analysis.rows_detected)
+        analysis_columns[2].metric("Listing links", len(saved_html_analysis.listing_links))
+        analysis_columns[3].metric("Detected models", len(saved_html_analysis.detected_models))
+        st.caption(saved_html_analysis.guidance)
+
+        if saved_html_analysis.detected_models:
+            st.write("Detected models:")
+            st.dataframe(pd.DataFrame({"model": saved_html_analysis.detected_models}), use_container_width=True)
+
+        if saved_html_analysis.listing_links:
+            st.write("Discovered listing links:")
+            st.dataframe(pd.DataFrame({"listing_url": saved_html_analysis.listing_links}), use_container_width=True)
+
     if saved_html_file is not None and st.button("Import saved HTML listing", key="import_saved_compatibility_html"):
         try:
-            html_bytes = saved_html_file.getvalue()
-            try:
-                html_text = html_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                html_text = html_bytes.decode("latin-1")
-
             with get_connection() as conn:
                 result = import_reference_html(
                     conn,
-                    html=html_text,
+                    html=saved_html_text,
                     page_url=reference_url.strip() or saved_html_file.name,
                     source_name=reference_source_name.strip() or "HardDrivesDirect",
                 )
