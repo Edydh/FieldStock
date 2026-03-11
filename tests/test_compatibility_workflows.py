@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing
+from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_search_results
 from modules.reference_search import compatibility_inventory_for_model, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
@@ -394,6 +394,113 @@ def test_analyze_reference_html_classifies_model_category_page() -> None:
 
         assert analysis.page_kind == "model_category_unknown"
         assert "DL20 G9" in analysis.detected_models
+
+
+def test_extract_harddrivesdirect_page_models_reads_page_level_compatibility() -> None:
+        html = """
+        <html>
+            <body>
+                <p>
+                    These HP Solid State Drives are compatible with these G10+ / G11 / G12 Servers & Systems
+                    HP Proliant DL Series: DL20 (G10+) DL360 (G11) DL380 (G12)
+                    Specifically designed for HPE Proliant Servers with 2.5-inch Basic Carrier Drive Bays
+                </p>
+            </body>
+        </html>
+        """
+
+        models = extract_harddrivesdirect_page_models(html)
+
+        assert "DL20 G10" in models
+        assert "DL360 G11" in models
+        assert "DL380 G12" in models
+
+
+def test_parse_harddrivesdirect_search_results_extracts_products_and_page_models() -> None:
+        html = """
+        <html>
+            <head><title>HP 2.5 G10+ G11 SAS BC SSD Specials</title></head>
+            <body>
+                <p>
+                    These HP Solid State Drives are compatible with these G10+ / G11 / G12 Servers & Systems
+                    HP Proliant DL Series: DL20 (G10+) DL360 (G11) DL380 (G12)
+                    Specifically designed for HPE Proliant Servers with 2.5-inch Basic Carrier Drive Bays
+                </p>
+                <div>
+                    <a href="product_info.php?products_id=1">HP 2.5 G10+ / G11 Basic Carrier SSD Write-Intensive P40480-B21 400-GB</a>
+                    <span>$395.95 New SSD Special Part# P40480-B21</span>
+                </div>
+                <div>
+                    <a href="product_info.php?products_id=2">HP 2.5 G10+ / G11 Basic Carrier SSD Mixed-Use P40560-B21 800-GB</a>
+                    <span>$525.95 New SSD Special Part# P40560-B21</span>
+                </div>
+            </body>
+        </html>
+        """
+
+        rows = parse_harddrivesdirect_search_results(html, "https://www.harddrivesdirect.com/search.php")
+
+        assert len(rows) == 2
+        assert rows[0]["part_number"] == "P40480-B21"
+        assert "DL20 G10" in rows[0]["system_models"]
+        assert rows[1]["part_number"] == "P40560-B21"
+
+
+def test_analyze_reference_html_classifies_search_results_listing() -> None:
+        html = """
+        <html>
+            <head><title>HP 2.5 G10+ G11 SAS BC SSD Specials</title></head>
+            <body>
+                <p>
+                    These HP Solid State Drives are compatible with these G10+ / G11 / G12 Servers & Systems
+                    HP Proliant DL Series: DL20 (G10+) DL360 (G11) DL380 (G12)
+                    Specifically designed for HPE Proliant Servers with 2.5-inch Basic Carrier Drive Bays
+                </p>
+                <div>
+                    <a href="product_info.php?products_id=1">HP 2.5 G10+ / G11 Basic Carrier SSD Write-Intensive P40480-B21 400-GB</a>
+                    <span>$395.95 New SSD Special Part# P40480-B21</span>
+                </div>
+            </body>
+        </html>
+        """
+
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/search.php")
+
+        assert analysis.page_kind == "search_results_listing"
+        assert analysis.rows_detected == 1
+
+
+def test_import_reference_html_imports_search_results_listing(conn: sqlite3.Connection) -> None:
+        html = """
+        <html>
+            <head><title>HP 2.5 G10+ G11 SAS BC SSD Specials</title></head>
+            <body>
+                <p>
+                    These HP Solid State Drives are compatible with these G10+ / G11 / G12 Servers & Systems
+                    HP Proliant DL Series: DL20 (G10+) DL360 (G11) DL380 (G12)
+                    Specifically designed for HPE Proliant Servers with 2.5-inch Basic Carrier Drive Bays
+                </p>
+                <div>
+                    <a href="product_info.php?products_id=1">HP 2.5 G10+ / G11 Basic Carrier SSD Write-Intensive P40480-B21 400-GB</a>
+                    <span>$395.95 New SSD Special Part# P40480-B21</span>
+                </div>
+            </body>
+        </html>
+        """
+
+        result = import_reference_html(
+                conn,
+                html=html,
+                page_url="https://www.harddrivesdirect.com/SAS_2_SFF_G10_BC_ssd_search_hp.php",
+                source_name="HP BC SSD Search",
+        )
+
+        models = search_system_models(conn, "DL20 G10")
+
+        assert result.rows_seen == 1
+        assert result.parts_upserted == 1
+        assert result.compatibilities_upserted >= 1
+        assert models
 
 
 def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:

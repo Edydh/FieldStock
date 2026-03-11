@@ -25,16 +25,18 @@ DEFAULT_WEB_HEADERS = {
 
 
 MODEL_PATTERNS = [
-    re.compile(r"\b(?:DL|ML|BL|SL)\s*\d+[A-Z-]*\s*G\d+\b"),
+    re.compile(r"\b(?:DL|ML|BL|SL)\s*\d+[A-Z-]*\s*G\d+(?:\+)?(?=[^A-Z0-9]|$)"),
     re.compile(r"\b(?:PROLIANT\s+)?(?:DL|ML|BL|SL)\s*\d+[A-Z-]*\b"),
-    re.compile(r"\bG\d+\s*-\s*G\d+\b"),
-    re.compile(r"\bG\d+(?:\s+G\d+)+\b"),
-    re.compile(r"\bG\d+\s*-\s*G\d+\b"),
+    re.compile(r"\bG\d+(?:\+)?\s*-\s*G\d+(?:\+)?(?=[^A-Z0-9]|$)"),
+    re.compile(r"\bG\d+(?:\+)?(?:\s+G\d+(?:\+)?)+(?=[^A-Z0-9]|$)"),
+    re.compile(r"\bG\d+(?:\+)?\s*-\s*G\d+(?:\+)?(?=[^A-Z0-9]|$)"),
     re.compile(r"\bMSA\d+\b"),
     re.compile(r"\bEVA\s+M\d+\b"),
     re.compile(r"\bM\d{4}\b"),
     re.compile(r"\b3PAR\b"),
 ]
+
+PART_NUMBER_PATTERN = re.compile(r"\b(?=[A-Z0-9-]*\d)[A-Z0-9]{4,10}-[A-Z0-9]{2,4}\b")
 
 
 @dataclass(slots=True)
@@ -58,6 +60,8 @@ class ReferenceHtmlAnalysis:
 
 def extract_candidate_models(product_name: str) -> list[str]:
     cleaned = normalize_text(product_name)
+    cleaned = re.sub(r"\(\s*(G\d+(?:\+)?)\s*\)", r" \1", cleaned)
+    cleaned = cleaned.replace("+", "")
     matches: list[str] = []
     for pattern in MODEL_PATTERNS:
         matches.extend(match.group(0) for match in pattern.finditer(cleaned))
@@ -391,6 +395,80 @@ def parse_harddrivesdirect_listing(html: str, page_url: str) -> list[dict[str, o
     return rows
 
 
+def extract_harddrivesdirect_page_models(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    page_text = normalize_text(soup.get_text(" ", strip=True))
+    compatibility_match = re.search(
+        r"COMPATIBLE WITH (?:THE FOLLOWING|THESE)\s+(.*?)(?:SPECIFICALLY DESIGNED|DISPLAYING \d+ TO \d+|RESULT PAGES|COUNTRY US DOLLAR PRICES|CONTACT US)",
+        page_text,
+    )
+    if compatibility_match:
+        return extract_candidate_models(compatibility_match.group(1))
+    return []
+
+
+def _clean_harddrivesdirect_product_text(text: str, part_number: str) -> str:
+    cleaned = normalize_text(text)
+    cleaned = re.sub(r"\$\s*[0-9,]+(?:\.[0-9]{2})?", " ", cleaned)
+    cleaned = re.sub(r"\bNEW\s+(?:SSD|HDD)?\s*SPECIAL\b", " ", cleaned)
+    cleaned = re.sub(r"\bSPECIAL\b", " ", cleaned)
+    cleaned = re.sub(r"\bPART#\s*" + re.escape(part_number) + r"\b", " ", cleaned)
+    cleaned = cleaned.replace("FLAG", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def parse_harddrivesdirect_search_results(html: str, page_url: str) -> list[dict[str, object]]:
+    soup = BeautifulSoup(html, "html.parser")
+    common_models = extract_harddrivesdirect_page_models(html)
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        anchor_text = normalize_text(anchor.get_text(" ", strip=True))
+        part_match = PART_NUMBER_PATTERN.search(anchor_text)
+        if part_match is None:
+            continue
+
+        part_number = part_match.group(0)
+        normalized_part = normalize_part_number(part_number)
+        if not normalized_part or normalized_part in seen:
+            continue
+
+        container = anchor.find_parent(["td", "div", "li"])
+        container_text = normalize_text(container.get_text(" ", strip=True)) if container is not None else anchor_text
+        description = _clean_harddrivesdirect_product_text(container_text or anchor_text, part_number)
+        if part_number not in description and anchor_text:
+            description = _clean_harddrivesdirect_product_text(anchor_text, part_number)
+
+        if not description:
+            continue
+
+        seen.add(normalized_part)
+        product_url = urljoin(page_url, anchor["href"])
+        manufacturer = "HPE" if any(token in description for token in ("HP ", "HPE", "PROLIANT")) else ""
+        rows.append(
+            {
+                "part_number": part_number,
+                "description": description,
+                "manufacturer": manufacturer,
+                "product_url": product_url,
+                "source_title": description,
+                "system_models": common_models or extract_candidate_models(description),
+                "aliases": infer_alias_part_numbers(part_number),
+            }
+        )
+
+    return rows
+
+
+def parse_reference_rows(html: str, page_url: str) -> list[dict[str, object]]:
+    combined_rows = parse_harddrivesdirect_listing(html, page_url)
+    if combined_rows:
+        return combined_rows
+    return parse_harddrivesdirect_search_results(html, page_url)
+
+
 def extract_harddrivesdirect_listing_links(html: str, page_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
@@ -427,18 +505,30 @@ def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
 
     page_title = next((candidate.strip() for candidate in title_candidates if candidate and candidate.strip()), page_url)
     normalized_text = normalize_text(soup.get_text(" ", strip=True))
-    rows = parse_harddrivesdirect_listing(html, page_url)
+    listing_rows = parse_harddrivesdirect_listing(html, page_url)
+    search_rows = parse_harddrivesdirect_search_results(html, page_url)
+    rows = listing_rows or search_rows
     listing_links = extract_harddrivesdirect_listing_links(html, page_url)
-    detected_models = extract_candidate_models(page_title)
+    detected_models = extract_harddrivesdirect_page_models(html) or extract_candidate_models(page_title)
 
-    if rows:
+    if listing_rows:
         return ReferenceHtmlAnalysis(
             page_kind="direct_listing",
             page_title=page_title,
-            rows_detected=len(rows),
+            rows_detected=len(listing_rows),
             listing_links=listing_links,
             detected_models=detected_models,
             guidance="This page contains direct part rows and can be imported.",
+        )
+
+    if search_rows:
+        return ReferenceHtmlAnalysis(
+            page_kind="search_results_listing",
+            page_title=page_title,
+            rows_detected=len(search_rows),
+            listing_links=listing_links,
+            detected_models=detected_models,
+            guidance="This page contains product search results with page-level compatibility context and can be imported.",
         )
 
     if listing_links:
@@ -491,7 +581,7 @@ def import_reference_html(
     source_type: str = "saved_html",
 ) -> ReferenceImportResult:
     analysis = analyze_reference_html(html, page_url)
-    rows = parse_harddrivesdirect_listing(html, page_url)
+    rows = parse_reference_rows(html, page_url)
     if analysis.page_kind == "configuration_index":
         preview_links = ", ".join(analysis.listing_links[:5])
         raise RuntimeError(
@@ -503,7 +593,7 @@ def import_reference_html(
             "This saved HTML looks like a model-specific or category-specific page, but no direct part rows were detected. "
             "Inspect the saved page structure before importing it."
         )
-    if analysis.page_kind != "direct_listing":
+    if analysis.page_kind not in {"direct_listing", "search_results_listing"}:
         raise RuntimeError("The saved HTML could not be recognized as an importable listing page.")
 
     return import_reference_rows(
