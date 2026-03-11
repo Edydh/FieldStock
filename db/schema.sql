@@ -61,6 +61,68 @@ CREATE TABLE IF NOT EXISTS import_runs (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS reference_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_name, source_type, source_url)
+);
+
+CREATE TABLE IF NOT EXISTS system_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    manufacturer TEXT,
+    model_name TEXT NOT NULL,
+    normalized_model_name TEXT NOT NULL,
+    model_family TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(normalized_model_name)
+);
+
+CREATE TABLE IF NOT EXISTS reference_parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL,
+    part_number TEXT NOT NULL,
+    normalized_part_number TEXT NOT NULL,
+    description TEXT,
+    manufacturer TEXT,
+    product_url TEXT,
+    source_title TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_id, normalized_part_number),
+    FOREIGN KEY(source_id) REFERENCES reference_sources(id)
+);
+
+CREATE TABLE IF NOT EXISTS reference_part_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_part_id INTEGER NOT NULL,
+    alias_part_number TEXT NOT NULL,
+    normalized_alias_part_number TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(reference_part_id, normalized_alias_part_number),
+    FOREIGN KEY(reference_part_id) REFERENCES reference_parts(id)
+);
+
+CREATE TABLE IF NOT EXISTS system_part_compatibility (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_model_id INTEGER NOT NULL,
+    reference_part_id INTEGER NOT NULL,
+    source_id INTEGER NOT NULL,
+    evidence TEXT,
+    source_url TEXT,
+    confidence REAL NOT NULL DEFAULT 0.75,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(system_model_id, reference_part_id, source_id),
+    FOREIGN KEY(system_model_id) REFERENCES system_models(id),
+    FOREIGN KEY(reference_part_id) REFERENCES reference_parts(id),
+    FOREIGN KEY(source_id) REFERENCES reference_sources(id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS parts_fts USING fts5(
     part_number,
     description,
@@ -93,3 +155,8 @@ CREATE INDEX IF NOT EXISTS idx_inventory_transactions_part_id ON inventory_trans
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_location_id ON inventory_transactions(location_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_created_at ON inventory_transactions(created_at);
 CREATE INDEX IF NOT EXISTS idx_import_runs_created_at ON import_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_system_models_normalized_model_name ON system_models(normalized_model_name);
+CREATE INDEX IF NOT EXISTS idx_reference_parts_normalized_part_number ON reference_parts(normalized_part_number);
+CREATE INDEX IF NOT EXISTS idx_reference_part_aliases_normalized_alias_part_number ON reference_part_aliases(normalized_alias_part_number);
+CREATE INDEX IF NOT EXISTS idx_system_part_compatibility_system_model_id ON system_part_compatibility(system_model_id);
+CREATE INDEX IF NOT EXISTS idx_system_part_compatibility_reference_part_id ON system_part_compatibility(reference_part_id);

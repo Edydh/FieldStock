@@ -7,6 +7,8 @@ import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, recent_import_runs, summarize_import
+from modules.reference_import import import_reference_rows, import_reference_url
+from modules.reference_search import compatibility_inventory_for_model, compatibility_reference_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_system_models
 from modules.search import recent_transactions, search_inventory, search_inventory_records, transactions_for_import_run
 
 
@@ -54,7 +56,7 @@ with st.sidebar:
     )
     st.info("This MVP supports snapshot imports first. Delta imports can be added once the stock workflow is stable.")
 
-import_tab, search_tab, adjustment_tab = st.tabs(["Import", "Inventory Search", "Stock Adjustment"])
+import_tab, search_tab, compatibility_tab, adjustment_tab = st.tabs(["Import", "Inventory Search", "Compatibility Search", "Stock Adjustment"])
 
 with import_tab:
     st.subheader("Excel Snapshot Import")
@@ -230,6 +232,237 @@ with search_tab:
         st.dataframe(pd.DataFrame([dict(row) for row in transactions]), use_container_width=True)
     else:
         st.info("No transactions recorded yet.")
+
+with compatibility_tab:
+    st.subheader("Compatibility Reference Search")
+    st.write("Build a local model-to-part reference from supplier pages, then cross-check compatible parts against your inventory.")
+
+    st.markdown("#### Long-Term Priority Matrix")
+    priority_columns = st.columns([2, 1])
+    priority_brand_filter = priority_columns[0].selectbox(
+        "Vendor focus",
+        options=["All", "HP/HPE", "DELL"],
+        index=0,
+        key="priority_brand_filter",
+    )
+    priority_limit = int(
+        priority_columns[1].selectbox(
+            "Rows",
+            options=[5, 10, 20],
+            index=1,
+            key="priority_limit",
+        )
+    )
+
+    with get_connection() as conn:
+        priority_rows = inventory_model_priority_matrix(
+            conn,
+            brand_filter="" if priority_brand_filter == "All" else priority_brand_filter,
+            limit=priority_limit,
+        )
+
+    with get_connection() as conn:
+        reference_summary = compatibility_reference_summary(conn)
+
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("System Models", int(reference_summary["system_models"]))
+    summary_columns[1].metric("Reference Parts", int(reference_summary["reference_parts"]))
+    summary_columns[2].metric("Compatibilities", int(reference_summary["compatibilities"]))
+    summary_columns[3].metric("Sources", int(reference_summary["sources"]))
+
+    if priority_rows:
+        priority_df = pd.DataFrame(priority_rows)
+        st.dataframe(
+            priority_df[
+                [
+                    "brand",
+                    "model",
+                    "family",
+                    "priority_score",
+                    "inventory_mentions",
+                    "distinct_parts",
+                    "category_diversity",
+                    "family_coverage",
+                    "longevity_score",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        top_priority = priority_rows[:5]
+        st.caption(
+            "Priority score blends current inventory mentions, distinct part coverage, category diversity, model-family breadth, and a simple longevity heuristic."
+        )
+        st.write("Suggested first models to build out:")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "brand": row["brand"],
+                        "model": row["model"],
+                        "priority_score": row["priority_score"],
+                        "inventory_mentions": row["inventory_mentions"],
+                        "example_part": row["examples"][0]["part_number"] if row["examples"] else "",
+                    }
+                    for row in top_priority
+                ]
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.info("No HP/HPE or Dell system models were detected in current inventory descriptions.")
+
+    st.markdown("#### Import From Website")
+    website_columns = st.columns([3, 2])
+    reference_url = website_columns[0].text_input(
+        "Listing URL",
+        value="https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
+        key="compatibility_reference_url",
+    )
+    reference_source_name = website_columns[1].text_input(
+        "Source label",
+        value="HardDrivesDirect",
+        key="compatibility_source_name",
+    )
+
+    if st.button("Fetch and import compatibility page", key="import_compatibility_page"):
+        try:
+            with get_connection() as conn:
+                result = import_reference_url(
+                    conn,
+                    url=reference_url.strip(),
+                    source_name=reference_source_name.strip() or "HardDrivesDirect",
+                )
+        except Exception as exc:
+            st.error(f"Compatibility import failed: {exc}")
+        else:
+            st.success(
+                "Compatibility import completed. "
+                f"Parsed {result.rows_seen} rows, added {result.models_upserted} models, "
+                f"{result.parts_upserted} parts, and {result.compatibilities_upserted} compatibility links."
+            )
+
+    st.markdown("#### Manual Reference Rows")
+    manual_upload = st.file_uploader(
+        "Optional CSV or Excel with columns: system_model, part_number, description, manufacturer, aliases",
+        type=["csv", "xlsx", "xlsm", "xls"],
+        key="compatibility_manual_upload",
+    )
+    if manual_upload is not None and st.button("Import uploaded reference rows", key="import_uploaded_reference_rows"):
+        try:
+            if manual_upload.name.lower().endswith(".csv"):
+                manual_df = pd.read_csv(manual_upload)
+            else:
+                manual_df = pd.read_excel(manual_upload)
+
+            required_columns = {"system_model", "part_number", "description"}
+            missing_columns = required_columns.difference(manual_df.columns)
+            if missing_columns:
+                raise ValueError(f"Missing required columns: {', '.join(sorted(missing_columns))}")
+
+            rows_to_import: list[dict[str, object]] = []
+            for record in manual_df.fillna("").to_dict("records"):
+                aliases = [value.strip() for value in str(record.get("aliases", "")).split(",") if value.strip()]
+                rows_to_import.append(
+                    {
+                        "system_models": [str(record.get("system_model", "")).strip()],
+                        "part_number": str(record.get("part_number", "")).strip(),
+                        "description": str(record.get("description", "")).strip(),
+                        "manufacturer": str(record.get("manufacturer", "")).strip(),
+                        "aliases": aliases,
+                    }
+                )
+
+            with get_connection() as conn:
+                result = import_reference_rows(
+                    conn,
+                    rows=rows_to_import,
+                    source_name="Manual Upload",
+                    source_type="manual_file",
+                    source_url=manual_upload.name,
+                )
+        except Exception as exc:
+            st.error(f"Manual compatibility import failed: {exc}")
+        else:
+            st.success(
+                f"Imported {result.rows_seen} manual row(s), {result.models_upserted} model(s), and {result.compatibilities_upserted} compatibility links."
+            )
+
+    st.markdown("#### Search By System Model")
+    compatibility_query = st.text_input(
+        "System model",
+        placeholder="Examples: DL560 G9, G8 G9, MSA2",
+        key="compatibility_query",
+    )
+    compatibility_available_only = st.checkbox(
+        "Only show compatible parts that are in stock",
+        value=True,
+        key="compatibility_available_only",
+    )
+
+    selected_model_row: dict[str, object] | None = None
+    inventory_detected_rows: list[dict[str, object]] = []
+    if compatibility_query.strip():
+        with get_connection() as conn:
+            model_rows = search_system_models(conn, compatibility_query.strip(), limit=50)
+            inventory_detected_rows = search_inventory_detected_models(conn, compatibility_query.strip(), limit=20)
+
+        if model_rows:
+            model_options = [dict(row) for row in model_rows]
+
+            def format_model_option(option: dict[str, object]) -> str:
+                manufacturer = str(option.get("manufacturer", "")).strip()
+                manufacturer_prefix = f"{manufacturer} | " if manufacturer else ""
+                return f"{manufacturer_prefix}{option['model_name']} | compatible parts {int(option['compatible_part_count'])}"
+
+            selected_model_row = st.selectbox(
+                "Matching system models",
+                options=model_options,
+                format_func=format_model_option,
+                key="selected_compatibility_model",
+            )
+            st.dataframe(pd.DataFrame(model_options), use_container_width=True)
+        else:
+            st.info("No compatible system models were found in the imported reference data for this search yet.")
+
+        st.write("Inventory-detected models:")
+        if inventory_detected_rows:
+            inventory_detected_df = pd.DataFrame(
+                [
+                    {
+                        "brand": row["brand"],
+                        "model": row["model"],
+                        "family": row["family"],
+                        "inventory_mentions": row["inventory_mentions"],
+                        "distinct_parts": row["distinct_parts"],
+                        "priority_score": row["priority_score"],
+                        "example_part": row["examples"][0]["part_number"] if row["examples"] else "",
+                        "example_description": row["examples"][0]["description"] if row["examples"] else "",
+                    }
+                    for row in inventory_detected_rows
+                ]
+            )
+            st.dataframe(inventory_detected_df, use_container_width=True)
+            if not model_rows:
+                st.caption(
+                    "This means the model is present in your inventory descriptions, but it has not been added to the compatibility reference dataset yet."
+                )
+        else:
+            st.info("No HP/HPE or Dell model mentions were detected in current inventory descriptions for this search.")
+
+    if selected_model_row is not None:
+        with get_connection() as conn:
+            compatibility_rows = compatibility_inventory_for_model(
+                conn,
+                int(selected_model_row["id"]),
+                available_only=compatibility_available_only,
+            )
+
+        if compatibility_rows:
+            compatibility_df = pd.DataFrame([dict(row) for row in compatibility_rows])
+            st.dataframe(compatibility_df, use_container_width=True)
+        else:
+            st.info("No compatible parts matched the current stock filter for the selected model.")
 
 with adjustment_tab:
     st.subheader("Stock Use and Adjustment")

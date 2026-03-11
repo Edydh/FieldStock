@@ -17,6 +17,11 @@ def normalize_part_number(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", text)
 
 
+def normalize_model_name(value: Any) -> str:
+    text = normalize_text(value)
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
 def safe_float(value: Any) -> float:
     if value is None or value == "":
         return 0.0
