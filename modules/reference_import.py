@@ -12,6 +12,18 @@ from bs4 import BeautifulSoup
 from modules.utils import normalize_model_name, normalize_part_number, normalize_text
 
 
+DEFAULT_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.harddrivesdirect.com/",
+}
+
+
 MODEL_PATTERNS = [
     re.compile(r"\b(?:DL|ML|BL|SL)\s*\d+[A-Z-]*\s*G\d+\b"),
     re.compile(r"\b(?:PROLIANT\s+)?(?:DL|ML|BL|SL)\s*\d+[A-Z-]*\b"),
@@ -348,18 +360,44 @@ def parse_harddrivesdirect_listing(html: str, page_url: str) -> list[dict[str, o
     return rows
 
 
+def import_reference_html(
+    conn: sqlite3.Connection,
+    html: str,
+    page_url: str,
+    source_name: str = "HardDrivesDirect",
+    source_type: str = "saved_html",
+) -> ReferenceImportResult:
+    rows = parse_harddrivesdirect_listing(html, page_url)
+    return import_reference_rows(
+        conn,
+        rows=rows,
+        source_name=source_name,
+        source_type=source_type,
+        source_url=page_url,
+    )
+
+
 def import_reference_url(
     conn: sqlite3.Connection,
     url: str,
     source_name: str = "HardDrivesDirect",
 ) -> ReferenceImportResult:
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    rows = parse_harddrivesdirect_listing(response.text, url)
-    return import_reference_rows(
+    try:
+        response = requests.get(url, headers=DEFAULT_WEB_HEADERS, timeout=30)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 403:
+            raise RuntimeError(
+                "The source website blocked the automated request with HTTP 403. "
+                "Open the page in your browser, save it as an HTML file, then use the saved HTML import option in the app."
+            ) from exc
+        raise
+
+    return import_reference_html(
         conn,
-        rows=rows,
+        html=response.text,
+        page_url=url,
         source_name=source_name,
         source_type="web_listing",
-        source_url=url,
     )

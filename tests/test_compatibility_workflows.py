@@ -4,10 +4,11 @@ import sqlite3
 from typing import Iterator
 
 import pytest
+import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import extract_candidate_models, import_reference_rows, parse_harddrivesdirect_listing
-from modules.reference_search import compatibility_inventory_for_model, inventory_model_priority_matrix, search_inventory_detected_models, search_system_models
+from modules.reference_import import extract_candidate_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing
+from modules.reference_search import compatibility_inventory_for_model, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
 def make_connection() -> sqlite3.Connection:
@@ -100,6 +101,124 @@ def test_compatibility_search_matches_local_inventory_by_alias(conn: sqlite3.Con
     assert rows[0]["match_status"] == "Matched in inventory"
 
 
+def test_search_reference_parts_matches_part_number_and_alias(conn: sqlite3.Connection) -> None:
+    part_id = upsert_part(
+        conn,
+        part_number="872737001",
+        description="Local stock HPE SAS drive",
+        manufacturer="HPE",
+        uom="EA",
+    )
+    location_id = upsert_location(conn, "Main", "A1")
+    record_inventory_adjustment(
+        conn,
+        part_id=part_id,
+        location_id=location_id,
+        qty_change=2,
+        created_by="tester",
+        reference="seed-002",
+        notes="Seed local stock",
+    )
+
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872737001", "872737-001"],
+            }
+        ],
+        source_name="HardDrivesDirect",
+        source_type="web_listing",
+        source_url="https://example.test/hp",
+    )
+
+    rows = search_reference_parts(conn, "872737001", available_only=True, limit=20)
+
+    assert rows
+    assert rows[0]["reference_part_number"] == "872737-001"
+    assert rows[0]["local_part_number"] == "872737001"
+    assert rows[0]["match_status"] == "Matched in inventory"
+    assert int(rows[0]["compatible_model_count"]) == 1
+
+
+def test_search_system_models_returns_browse_results_when_query_empty(conn: sqlite3.Connection) -> None:
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "830287-B21",
+                "description": "830287-B21 HP Intel Xeon E5-4655v4 2.5GHz DL560 G9",
+                "manufacturer": "HPE",
+                "system_models": ["DL560 G9"],
+                "aliases": ["830287-B21", "830287B21"],
+            }
+        ],
+        source_name="HardDrivesDirect",
+        source_type="web_listing",
+        source_url="https://example.test/hp",
+    )
+
+    rows = search_system_models(conn, "", limit=20)
+
+    assert rows
+    assert rows[0]["model_name"] == "DL560 G9"
+
+
+def test_search_related_compatibility_expands_from_matched_part_to_related_model(conn: sqlite3.Connection) -> None:
+    part_id = upsert_part(
+        conn,
+        part_number="872737001",
+        description="Local stock HPE SAS drive",
+        manufacturer="HPE",
+        uom="EA",
+    )
+    location_id = upsert_location(conn, "Main", "A1")
+    record_inventory_adjustment(
+        conn,
+        part_id=part_id,
+        location_id=location_id,
+        qty_change=3,
+        created_by="tester",
+        reference="seed-003",
+        notes="Seed local stock",
+    )
+
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872737001", "872737-001"],
+            },
+            {
+                "part_number": "830287-B21",
+                "description": "830287-B21 HP Intel Xeon E5-4655v4 2.5GHz G8 G9",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["830287-B21", "830287B21"],
+            },
+        ],
+        source_name="HardDrivesDirect",
+        source_type="web_listing",
+        source_url="https://example.test/hp",
+    )
+
+    rows = search_related_compatibility(conn, "872737001", available_only=False, limit=20)
+
+    assert rows
+    reference_part_numbers = {row["reference_part_number"] for row in rows}
+    assert "872737-001" in reference_part_numbers
+    assert "830287-B21" in reference_part_numbers
+    assert any(row["relation_type"] == "Matched reference part" for row in rows)
+
+
 def test_parse_harddrivesdirect_listing_extracts_rows_and_models() -> None:
     html = """
     <html>
@@ -125,6 +244,49 @@ def test_parse_harddrivesdirect_listing_extracts_rows_and_models() -> None:
     assert rows[0]["part_number"] == "872737-001"
     assert "G8 G9" in rows[0]["system_models"]
     assert "DL560 G9" in rows[1]["system_models"]
+
+
+def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:
+        html = """
+        <html>
+            <body>
+                <table>
+                    <tr><th>Product Name</th><th>Part#</th></tr>
+                    <tr>
+                        <td><a href="product_info.php?products_id=1">872737-001 HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC</a></td>
+                        <td>872737-001</td>
+                    </tr>
+                </table>
+            </body>
+        </html>
+        """
+
+        result = import_reference_html(
+                conn,
+                html=html,
+                page_url="https://example.test/hp",
+                source_name="Saved Page",
+        )
+
+        models = search_system_models(conn, "G8 G9")
+
+        assert result.rows_seen == 1
+        assert result.parts_upserted == 1
+        assert result.compatibilities_upserted == 1
+        assert len(models) == 1
+
+
+def test_import_reference_url_returns_actionable_error_on_403(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(*args: object, **kwargs: object) -> requests.Response:
+                response = requests.Response()
+                response.status_code = 403
+                response.url = "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php"
+                raise requests.HTTPError(response=response)
+
+        monkeypatch.setattr("modules.reference_import.requests.get", fake_get)
+
+        with pytest.raises(RuntimeError, match="save it as an HTML file"):
+                import_reference_url(conn, "https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php")
 
 
 def test_extract_candidate_models_handles_common_patterns() -> None:

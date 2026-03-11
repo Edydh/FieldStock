@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 import re
 import sqlite3
 
-from modules.utils import normalize_model_name
+from modules.utils import normalize_model_name, normalize_part_number
 
 
 HP_MODEL_PATTERN = re.compile(r"\b(?:DL|ML|BL|SL)\s*\d{2,4}[A-Z]{0,3}\s*G\d+\b", re.I)
@@ -235,6 +235,232 @@ def search_system_models(
         LIMIT ?
         """,
         (cleaned, wildcard, normalized, normalize_model_name(cleaned), limit),
+    ).fetchall()
+
+
+def search_reference_parts(
+    conn: sqlite3.Connection,
+    query: str,
+    available_only: bool = False,
+    limit: int = 200,
+) -> list[sqlite3.Row]:
+    cleaned = query.strip()
+    wildcard = f"%{cleaned.upper()}%"
+    normalized_part = normalize_part_number(cleaned)
+    available_sql = "HAVING COALESCE(local_inventory.total_qty_on_hand, 0) > 0" if available_only else ""
+
+    return conn.execute(
+        f"""
+        WITH model_counts AS (
+            SELECT
+                spc.reference_part_id,
+                COUNT(DISTINCT spc.system_model_id) AS compatible_model_count,
+                GROUP_CONCAT(DISTINCT sm.model_name) AS compatible_models
+            FROM system_part_compatibility spc
+            INNER JOIN system_models sm ON sm.id = spc.system_model_id
+            GROUP BY spc.reference_part_id
+        ),
+        local_inventory AS (
+            SELECT
+                p.normalized_part_number,
+                p.part_number AS local_part_number,
+                p.description AS local_description,
+                p.manufacturer AS local_oem,
+                SUM(ib.qty_on_hand) AS total_qty_on_hand,
+                GROUP_CONCAT(
+                    l.warehouse_code || '/' || l.location_code || ' (' || printf('%.2f', ib.qty_on_hand) || ')',
+                    '; '
+                ) AS stock_locations
+            FROM parts p
+            INNER JOIN inventory_balances ib ON ib.part_id = p.id
+            INNER JOIN locations l ON l.id = ib.location_id
+            GROUP BY p.normalized_part_number, p.part_number, p.description, p.manufacturer
+        )
+        SELECT
+            rp.id,
+            rp.part_number AS reference_part_number,
+            rp.description AS reference_description,
+            rp.manufacturer AS reference_manufacturer,
+            rs.source_name,
+            rp.product_url,
+            COALESCE(mc.compatible_model_count, 0) AS compatible_model_count,
+            COALESCE(mc.compatible_models, '') AS compatible_models,
+            local_inventory.local_part_number,
+            local_inventory.local_description,
+            local_inventory.local_oem,
+            COALESCE(local_inventory.total_qty_on_hand, 0) AS qty_on_hand,
+            local_inventory.stock_locations,
+            CASE WHEN local_inventory.local_part_number IS NULL THEN 'No local match' ELSE 'Matched in inventory' END AS match_status
+        FROM reference_parts rp
+        INNER JOIN reference_sources rs ON rs.id = rp.source_id
+        LEFT JOIN model_counts mc ON mc.reference_part_id = rp.id
+        LEFT JOIN reference_part_aliases rpa ON rpa.reference_part_id = rp.id
+        LEFT JOIN local_inventory
+            ON local_inventory.normalized_part_number = rp.normalized_part_number
+            OR local_inventory.normalized_part_number = rpa.normalized_alias_part_number
+        WHERE (
+            ? = ''
+            OR UPPER(rp.part_number) LIKE ?
+            OR UPPER(COALESCE(rp.description, '')) LIKE ?
+            OR UPPER(COALESCE(rp.manufacturer, '')) LIKE ?
+            OR UPPER(COALESCE(rpa.alias_part_number, '')) LIKE ?
+            OR REPLACE(UPPER(rp.part_number), '-', '') LIKE '%' || ? || '%'
+            OR REPLACE(UPPER(COALESCE(rpa.alias_part_number, '')), '-', '') LIKE '%' || ? || '%'
+        )
+        GROUP BY
+            rp.id,
+            rp.part_number,
+            rp.description,
+            rp.manufacturer,
+            rs.source_name,
+            rp.product_url,
+            mc.compatible_model_count,
+            mc.compatible_models,
+            local_inventory.local_part_number,
+            local_inventory.local_description,
+            local_inventory.local_oem,
+            local_inventory.total_qty_on_hand,
+            local_inventory.stock_locations
+        {available_sql}
+        ORDER BY
+            CASE WHEN UPPER(rp.part_number) = UPPER(?) THEN 0 ELSE 1 END,
+            qty_on_hand DESC,
+            compatible_model_count DESC,
+            rp.part_number ASC
+        LIMIT ?
+        """,
+        (cleaned, wildcard, wildcard, wildcard, wildcard, normalized_part, normalized_part, cleaned, limit),
+    ).fetchall()
+
+
+def search_related_compatibility(
+    conn: sqlite3.Connection,
+    query: str,
+    available_only: bool = True,
+    limit: int = 500,
+) -> list[sqlite3.Row]:
+    cleaned = query.strip()
+    if not cleaned:
+        return []
+
+    wildcard = f"%{cleaned.upper()}%"
+    normalized_model = f"%{normalize_model_name(cleaned)}%"
+    normalized_part = normalize_part_number(cleaned)
+    available_sql = "AND COALESCE(local_inventory.total_qty_on_hand, 0) > 0" if available_only else ""
+
+    return conn.execute(
+        f"""
+        WITH matched_models AS (
+            SELECT sm.id
+            FROM system_models sm
+            WHERE sm.model_name LIKE ? OR sm.normalized_model_name LIKE ?
+        ),
+        matched_parts AS (
+            SELECT DISTINCT rp.id
+            FROM reference_parts rp
+            LEFT JOIN reference_part_aliases rpa ON rpa.reference_part_id = rp.id
+            WHERE (
+                UPPER(rp.part_number) LIKE ?
+                OR UPPER(COALESCE(rp.description, '')) LIKE ?
+                OR UPPER(COALESCE(rp.manufacturer, '')) LIKE ?
+                OR UPPER(COALESCE(rpa.alias_part_number, '')) LIKE ?
+                OR REPLACE(UPPER(rp.part_number), '-', '') LIKE '%' || ? || '%'
+                OR REPLACE(UPPER(COALESCE(rpa.alias_part_number, '')), '-', '') LIKE '%' || ? || '%'
+            )
+        ),
+        selected_models AS (
+            SELECT id FROM matched_models
+            UNION
+            SELECT DISTINCT spc.system_model_id
+            FROM system_part_compatibility spc
+            INNER JOIN matched_parts mp ON mp.id = spc.reference_part_id
+        ),
+        reference_candidates AS (
+            SELECT
+                rp.id AS reference_part_id,
+                rp.normalized_part_number AS normalized_value
+            FROM reference_parts rp
+            UNION
+            SELECT
+                rpa.reference_part_id,
+                rpa.normalized_alias_part_number AS normalized_value
+            FROM reference_part_aliases rpa
+        ),
+        local_inventory AS (
+            SELECT
+                p.normalized_part_number,
+                p.part_number AS local_part_number,
+                p.description AS local_description,
+                p.manufacturer AS local_oem,
+                SUM(ib.qty_on_hand) AS total_qty_on_hand,
+                GROUP_CONCAT(
+                    l.warehouse_code || '/' || l.location_code || ' (' || printf('%.2f', ib.qty_on_hand) || ')',
+                    '; '
+                ) AS stock_locations
+            FROM parts p
+            INNER JOIN inventory_balances ib ON ib.part_id = p.id
+            INNER JOIN locations l ON l.id = ib.location_id
+            GROUP BY p.normalized_part_number, p.part_number, p.description, p.manufacturer
+        )
+        SELECT
+            sm.model_name,
+            sm.manufacturer AS model_manufacturer,
+            rp.part_number AS reference_part_number,
+            rp.description AS reference_description,
+            rp.manufacturer AS reference_manufacturer,
+            rs.source_name,
+            spc.source_url,
+            spc.confidence,
+            local_inventory.local_part_number,
+            local_inventory.local_description,
+            local_inventory.local_oem,
+            COALESCE(local_inventory.total_qty_on_hand, 0) AS qty_on_hand,
+            local_inventory.stock_locations,
+            CASE WHEN local_inventory.local_part_number IS NULL THEN 'No local match' ELSE 'Matched in inventory' END AS match_status,
+            CASE
+                WHEN sm.id IN (SELECT id FROM matched_models) AND rp.id IN (SELECT id FROM matched_parts) THEN 'Matched model and part'
+                WHEN sm.id IN (SELECT id FROM matched_models) THEN 'Matched system model'
+                WHEN rp.id IN (SELECT id FROM matched_parts) THEN 'Matched reference part'
+                ELSE 'Related compatibility'
+            END AS relation_type
+        FROM system_part_compatibility spc
+        INNER JOIN selected_models selected ON selected.id = spc.system_model_id
+        INNER JOIN system_models sm ON sm.id = spc.system_model_id
+        INNER JOIN reference_parts rp ON rp.id = spc.reference_part_id
+        INNER JOIN reference_sources rs ON rs.id = spc.source_id
+        LEFT JOIN reference_candidates rc ON rc.reference_part_id = rp.id
+        LEFT JOIN local_inventory ON local_inventory.normalized_part_number = rc.normalized_value
+        WHERE 1 = 1
+        {available_sql}
+        GROUP BY
+            sm.id,
+            sm.model_name,
+            sm.manufacturer,
+            rp.id,
+            rp.part_number,
+            rp.description,
+            rp.manufacturer,
+            rs.source_name,
+            spc.source_url,
+            spc.confidence,
+            local_inventory.local_part_number,
+            local_inventory.local_description,
+            local_inventory.local_oem,
+            local_inventory.total_qty_on_hand,
+            local_inventory.stock_locations
+        ORDER BY
+            CASE relation_type
+                WHEN 'Matched model and part' THEN 0
+                WHEN 'Matched system model' THEN 1
+                WHEN 'Matched reference part' THEN 2
+                ELSE 3
+            END,
+            qty_on_hand DESC,
+            sm.model_name ASC,
+            rp.part_number ASC
+        LIMIT ?
+        """,
+        (wildcard, normalized_model, wildcard, wildcard, wildcard, wildcard, normalized_part, normalized_part, limit),
     ).fetchall()
 
 
