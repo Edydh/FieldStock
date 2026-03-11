@@ -9,7 +9,7 @@ import pytest
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, import_snapshot, recent_import_runs, summarize_import
-from modules.search import search_inventory
+from modules.search import search_inventory, transactions_for_import_run
 
 
 def make_connection() -> sqlite3.Connection:
@@ -516,6 +516,55 @@ def test_recent_import_runs_filters_by_date_range(conn: sqlite3.Connection) -> N
 
     assert len(runs) == 1
     assert runs[0]["reference"] == "import-002"
+
+
+def test_transactions_for_import_run_returns_related_snapshot_rows(conn: sqlite3.Connection) -> None:
+    initial_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            },
+            {
+                "Product identification": "P-200",
+                "Product name": "Drive 600GB",
+                "Warehouse": "Main",
+                "Location": "B2",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            },
+        ]
+    )
+    updated_file = make_excel_bytes(
+        [
+            {
+                "Product identification": "P-100",
+                "Product name": "Drive 300GB",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 4,
+            }
+        ]
+    )
+
+    import_snapshot(conn=conn, file_bytes=initial_file, column_map=None, created_by="tester", reference="import-001")
+    import_snapshot(conn=conn, file_bytes=updated_file, column_map=None, created_by="tester", reference="import-002")
+
+    rows = transactions_for_import_run(conn, "import-002")
+
+    assert len(rows) == 2
+    assert {row["part_number"] for row in rows} == {"P-100", "P-200"}
+    assert {float(row["qty_change"]) for row in rows} == {-1.0, -2.0}
+    assert all(row["reference"] == "import-002" for row in rows)
+
+
+def test_transactions_for_import_run_returns_empty_for_blank_reference(conn: sqlite3.Connection) -> None:
+    assert transactions_for_import_run(conn, "") == []
 
 
 def test_search_inventory_available_only_filters_zero_stock(conn: sqlite3.Connection) -> None:

@@ -112,3 +112,37 @@ def recent_transactions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
         """,
         (limit,),
     ).fetchall()
+
+
+def transactions_for_import_run(
+    conn: sqlite3.Connection,
+    reference: str,
+    limit: int = 500,
+) -> list[sqlite3.Row]:
+    cleaned_reference = reference.strip()
+    if not cleaned_reference:
+        return []
+
+    return conn.execute(
+        """
+        SELECT
+            t.created_at,
+            t.transaction_type,
+            t.qty_change,
+            t.reference,
+            t.created_by,
+            t.notes,
+            p.part_number,
+            p.description,
+            p.manufacturer AS oem,
+            l.warehouse_code,
+            l.location_code
+        FROM inventory_transactions t
+        INNER JOIN parts p ON p.id = t.part_id
+        INNER JOIN locations l ON l.id = t.location_id
+        WHERE t.reference = ?
+        ORDER BY t.created_at DESC, t.id DESC
+        LIMIT ?
+        """,
+        (cleaned_reference, limit),
+    ).fetchall()
