@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_product_page, parse_harddrivesdirect_search_results
+from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, analyze_reference_pdf_pages, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_product_page, parse_harddrivesdirect_search_results, parse_reference_pdf_pages
 from modules.reference_search import compatibility_inventory_for_model, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
@@ -613,6 +613,95 @@ def test_import_reference_html_imports_product_detail_attributes(conn: sqlite3.C
         assert any(row[0] == "461137-S21" for row in alias_rows)
         assert any(row[0] == "capacity" and row[1] == "1TB" for row in attribute_rows)
         assert any(row[0] == "ports" and row[1] == "DUAL PORT" for row in attribute_rows)
+
+
+def test_parse_reference_pdf_pages_extracts_part_rows_and_attributes() -> None:
+    page_texts = [
+        """
+        HP ProLiant DL180 Generation 5
+        Storage Options
+        507127-B21 HP 500GB 7.2K LFF SATA HDD OPTION KIT FOR DL180 G5
+        458928-001 SPARE HDD CARRIER FOR DL180 G5
+        """
+    ]
+
+    rows = parse_reference_pdf_pages(page_texts, "DL180-G5-manual.pdf", document_title="HP ProLiant DL180 G5 Manual")
+
+    assert len(rows) == 2
+    assert rows[0]["part_number"] == "507127-B21"
+    assert "DL180 G5" in rows[0]["system_models"]
+    assert rows[0]["attributes"]["document_type"] == "pdf_manual"
+    assert rows[0]["attributes"]["source_page"] == "1"
+    assert rows[0]["attributes"]["document_section"] == "STORAGE OPTIONS"
+
+
+def test_analyze_reference_pdf_pages_classifies_text_pdf_with_parts() -> None:
+    page_texts = [
+        """
+        HP ProLiant DL180 Generation 5
+        Storage Options
+        507127-B21 HP 500GB 7.2K LFF SATA HDD OPTION KIT FOR DL180 G5
+        """
+    ]
+
+    analysis = analyze_reference_pdf_pages(page_texts, "DL180-G5-manual.pdf", document_title="HP ProLiant DL180 G5 Manual")
+
+    assert analysis.page_kind == "text_pdf_manual"
+    assert analysis.page_count == 1
+    assert analysis.rows_detected == 1
+    assert "DL180 G5" in analysis.detected_models
+    assert "507127-B21" in analysis.detected_part_numbers
+
+
+def test_analyze_reference_pdf_pages_classifies_text_pdf_without_parts() -> None:
+    page_texts = [
+        """
+        HP ProLiant DL180 Generation 5
+        Specifications
+        Supports twelve large form factor SATA drives and redundant power supplies.
+        """
+    ]
+
+    analysis = analyze_reference_pdf_pages(page_texts, "DL180-G5-manual.pdf", document_title="HP ProLiant DL180 G5 Manual")
+
+    assert analysis.page_kind == "text_pdf_no_parts"
+    assert analysis.rows_detected == 0
+    assert "DL180 G5" in analysis.detected_models
+
+
+def test_parse_reference_pdf_pages_prefers_adjacent_label_over_note_text() -> None:
+    page_texts = [
+        """
+        Optional Upgrades
+        512 MB Battery-backed write cache upgrade
+        405148-B21
+        Battery-backed write cache upgrade
+        QuickSpecs
+        """
+    ]
+
+    rows = parse_reference_pdf_pages(page_texts, "DL180-G5-manual.pdf", document_title="HP ProLiant DL180 G5 Manual")
+
+    assert len(rows) == 1
+    assert rows[0]["part_number"] == "405148-B21"
+    assert rows[0]["description"] == "512 MB BATTERY-BACKED WRITE CACHE UPGRADE"
+
+
+def test_parse_reference_pdf_pages_extracts_inline_description_without_blank_result() -> None:
+    page_texts = [
+        """
+        NOTE:
+        The addition of a Smart Array Controller requires the addition of a
+        SAS/SATA Multi-lane cable (464830-B21)
+        ONLY.
+        """
+    ]
+
+    rows = parse_reference_pdf_pages(page_texts, "DL180-G5-manual.pdf", document_title="HP ProLiant DL180 G5 Manual")
+
+    assert len(rows) == 1
+    assert rows[0]["part_number"] == "464830-B21"
+    assert "SAS/SATA MULTI-LANE CABLE" in rows[0]["description"]
 
 
 def test_import_reference_html_imports_saved_listing(conn: sqlite3.Connection) -> None:

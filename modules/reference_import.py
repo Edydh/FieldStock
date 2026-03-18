@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from dataclasses import dataclass
 import re
 import sqlite3
@@ -58,6 +59,17 @@ class ReferenceHtmlAnalysis:
     guidance: str
 
 
+@dataclass(slots=True)
+class ReferencePdfAnalysis:
+    page_kind: str
+    page_title: str
+    page_count: int
+    rows_detected: int
+    detected_models: list[str]
+    detected_part_numbers: list[str]
+    guidance: str
+
+
 PRODUCT_ATTRIBUTE_LABELS = {
     "OPTION PART#": "option_part_number",
     "SMARTBUY PART#": "smartbuy_part_number",
@@ -87,6 +99,7 @@ PRODUCT_ATTRIBUTE_LABELS = {
 def extract_candidate_models(product_name: str) -> list[str]:
     cleaned = normalize_text(product_name)
     cleaned = re.sub(r"\(\s*(G\d+(?:\+)?)\s*\)", r" \1", cleaned)
+    cleaned = re.sub(r"\bGENERATION\s+(\d+)\b", r" G\1", cleaned)
     cleaned = cleaned.replace("+", "")
     matches: list[str] = []
     for pattern in MODEL_PATTERNS:
@@ -102,6 +115,19 @@ def extract_candidate_models(product_name: str) -> list[str]:
         seen.add(normalized)
         ordered.append(display_name)
     return ordered
+
+
+def _is_likely_reference_part_number(candidate: str) -> bool:
+    normalized_candidate = normalize_text(candidate)
+    if not normalized_candidate:
+        return False
+    if PART_NUMBER_PATTERN.fullmatch(normalized_candidate) is None:
+        return False
+    if re.fullmatch(r"20\d{2}-20\d{2}", normalized_candidate):
+        return False
+    if re.fullmatch(r"\d{2,5}BASE-[A-Z0-9]+", normalized_candidate):
+        return False
+    return True
 
 
 def infer_alias_part_numbers(part_number: str) -> list[str]:
@@ -438,7 +464,7 @@ def parse_harddrivesdirect_listing(html: str, page_url: str) -> list[dict[str, o
 
         normalized_part = normalize_part_number(part_number)
         key = (normalized_part, product_name)
-        if not normalized_part or key in seen:
+        if not _is_likely_reference_part_number(part_number) or key in seen:
             continue
         seen.add(key)
 
@@ -496,6 +522,8 @@ def parse_harddrivesdirect_search_results(html: str, page_url: str) -> list[dict
             continue
 
         part_number = part_match.group(0)
+        if not _is_likely_reference_part_number(part_number):
+            continue
         normalized_part = normalize_part_number(part_number)
         if not normalized_part or normalized_part in seen:
             continue
@@ -613,6 +641,8 @@ def parse_harddrivesdirect_product_page(html: str, page_url: str) -> dict[str, o
         if part_match is None:
             return None
         primary_part = part_match.group(0)
+    if not _is_likely_reference_part_number(primary_part):
+        return None
 
     description_block = _extract_product_text_block(normalized_text, "DESCRIPTION:", ("PART NUMBER(S)", "OVERVIEW:"))
     description = description_block or normalize_text(title)
@@ -635,6 +665,269 @@ def parse_harddrivesdirect_product_page(html: str, page_url: str) -> dict[str, o
         "aliases": aliases,
         "attributes": attributes,
     }
+
+
+def _extract_pdf_page_texts(pdf_bytes: bytes) -> list[str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF import support is not installed. Install the pypdf package and restart the app."
+        ) from exc
+
+    reader = PdfReader(BytesIO(pdf_bytes))
+    page_texts: list[str] = []
+    for page in reader.pages:
+        page_texts.append(page.extract_text() or "")
+    return page_texts
+
+
+def _guess_document_title(page_texts: list[str], fallback_title: str) -> str:
+    cleaned_fallback = normalize_text(fallback_title)
+    cleaned_fallback = re.sub(r"\.PDF$", "", cleaned_fallback).strip()
+    if cleaned_fallback and len(cleaned_fallback) >= 8:
+        return cleaned_fallback[:160]
+
+    for page_text in page_texts[:2]:
+        for raw_line in page_text.splitlines():
+            cleaned_line = normalize_text(raw_line)
+            if cleaned_line and len(cleaned_line) >= 12:
+                return cleaned_line[:160]
+    return fallback_title
+
+
+def _looks_like_pdf_heading(line: str) -> bool:
+    if not line or len(line) > 100:
+        return False
+    if PART_NUMBER_PATTERN.search(line):
+        return False
+    alpha_count = sum(character.isalpha() for character in line)
+    return alpha_count >= 6
+
+
+def _clean_pdf_description_candidate(text: str, part_number: str) -> str:
+    cleaned = normalize_text(text)
+    cleaned = re.sub(re.escape(normalize_text(part_number)), " ", cleaned)
+    cleaned = re.sub(r"\b(?:OPTION|SMARTBUY|SPARE|ASSEMBLY)\s+PART#\s*", " ", cleaned)
+    cleaned = re.sub(r"\bPART\s+NUMBER\b", " ", cleaned)
+    cleaned = re.sub(r"\bNOTE:?(?:NOTE:?)*\b", " ", cleaned)
+    cleaned = re.sub(r"\bQUICKSPECS\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;:-")
+    if len(cleaned) > 240:
+        cleaned = cleaned[:240].rsplit(" ", 1)[0]
+    return cleaned
+
+
+def _pdf_description_score(candidate: str, context_line: str) -> int:
+    if not candidate:
+        return -100
+
+    score = 0
+    upper_candidate = candidate.upper()
+    score += min(len(candidate), 120)
+    if 12 <= len(candidate) <= 120:
+        score += 20
+    if PART_NUMBER_PATTERN.search(candidate):
+        score -= 60
+    if any(token in upper_candidate for token in ("NOTE", "REQUIRED", "QUICKSPECS", "OPTIONAL UPGRADESOPTIONAL UPGRADES")):
+        score -= 35
+    if any(token in upper_candidate for token in ("REQUIRES THE ADDITION OF", "IF 2 PROCESSORS ARE DESIRED", "YOU MUST START WITH")):
+        score -= 45
+    if any(token in upper_candidate for token in ("CABLE", "CONTROLLER", "UPGRADE", "SWITCH", "ADAPTER", "DRIVE", "MEMORY", "PROCESSOR", "POWER", "RAIL", "KIT")):
+        score += 25
+    if len(candidate) <= 60 and any(token in upper_candidate for token in ("CABLE", "CONTROLLER", "UPGRADE", "SWITCH", "ADAPTER", "DRIVE", "MEMORY", "PROCESSOR", "POWER", "RAIL", "KIT")):
+        score += 18
+    if context_line == "previous":
+        score += 8
+    if context_line == "next":
+        score += 6
+    if context_line == "current":
+        score += 10
+    if context_line == "current" and any(token in upper_candidate for token in ("CABLE", "CONTROLLER", "UPGRADE", "SWITCH", "ADAPTER", "DRIVE", "MEMORY", "PROCESSOR", "POWER", "RAIL", "KIT")):
+        score += 18
+    return score
+
+
+def _clean_pdf_part_description(lines: list[str], line_index: int, part_number: str) -> str:
+    candidate_specs: list[tuple[str, str]] = []
+    for offset, label in ((-2, "previous_far"), (-1, "previous"), (0, "current"), (1, "next"), (2, "next_far")):
+        candidate_index = line_index + offset
+        if 0 <= candidate_index < len(lines):
+            candidate_text = _clean_pdf_description_candidate(lines[candidate_index], part_number)
+            candidate_specs.append((candidate_text, label))
+
+    best_candidate = ""
+    best_score = -1000
+    for candidate_text, label in candidate_specs:
+        score = _pdf_description_score(candidate_text, label)
+        if score > best_score:
+            best_candidate = candidate_text
+            best_score = score
+
+    if best_candidate:
+        return best_candidate
+
+    fallback = _clean_pdf_description_candidate(lines[line_index], part_number)
+    return fallback or normalize_text(part_number)
+
+
+def parse_reference_pdf_pages(
+    page_texts: list[str],
+    page_url: str,
+    document_title: str = "",
+) -> list[dict[str, object]]:
+    fallback_title = normalize_text(document_title) or normalize_text(page_url)
+    title = _guess_document_title(page_texts, fallback_title)
+    document_text = " ".join(normalize_text(page_text) for page_text in page_texts if page_text)
+    document_models = extract_candidate_models(document_text)
+    document_manufacturer = ""
+    if any(token in document_text for token in ("PROLIANT", "HPE", "HP ")):
+        document_manufacturer = "HPE"
+    elif any(token in document_text for token in ("POWEREDGE", "DELL")):
+        document_manufacturer = "DELL"
+
+    rows: list[dict[str, object]] = []
+    seen_parts: set[str] = set()
+    for page_number, page_text in enumerate(page_texts, start=1):
+        normalized_lines = [normalize_text(line) for line in page_text.splitlines()]
+        normalized_lines = [line for line in normalized_lines if line]
+        if not normalized_lines:
+            continue
+
+        page_models = extract_candidate_models(" ".join(normalized_lines)) or document_models
+        current_heading = ""
+        for line_index, line in enumerate(normalized_lines):
+            if _looks_like_pdf_heading(line):
+                current_heading = line
+
+            part_matches = [match.group(0) for match in PART_NUMBER_PATTERN.finditer(line)]
+            if not part_matches:
+                continue
+
+            for part_number in part_matches:
+                normalized_part = normalize_part_number(part_number)
+                if not _is_likely_reference_part_number(part_number) or normalized_part in seen_parts:
+                    continue
+                seen_parts.add(normalized_part)
+
+                description = _clean_pdf_part_description(normalized_lines, line_index, part_number)
+                if not description:
+                    description = line
+
+                attributes = {
+                    "document_type": "pdf_manual",
+                    "source_page": str(page_number),
+                }
+                if current_heading:
+                    attributes["document_section"] = current_heading
+
+                rows.append(
+                    {
+                        "part_number": part_number,
+                        "description": description,
+                        "manufacturer": document_manufacturer,
+                        "product_url": f"{page_url}#page={page_number}" if page_url else "",
+                        "source_title": title,
+                        "system_models": page_models,
+                        "aliases": infer_alias_part_numbers(part_number),
+                        "attributes": attributes,
+                    }
+                )
+
+    return rows
+
+
+def analyze_reference_pdf_pages(
+    page_texts: list[str],
+    page_url: str,
+    document_title: str = "",
+) -> ReferencePdfAnalysis:
+    fallback_title = normalize_text(document_title) or normalize_text(page_url)
+    title = _guess_document_title(page_texts, fallback_title)
+    normalized_pages = [normalize_text(page_text) for page_text in page_texts if normalize_text(page_text)]
+    if not normalized_pages:
+        return ReferencePdfAnalysis(
+            page_kind="empty_or_scanned_pdf",
+            page_title=title,
+            page_count=len(page_texts),
+            rows_detected=0,
+            detected_models=[],
+            detected_part_numbers=[],
+            guidance="No extractable text was found in this PDF. It may be image-only and would need OCR support.",
+        )
+
+    rows = parse_reference_pdf_pages(page_texts, page_url, document_title=document_title)
+    document_text = " ".join(normalized_pages)
+    detected_models = extract_candidate_models(document_text)
+    detected_part_numbers = sorted({str(row["part_number"]) for row in rows})[:25]
+    if rows:
+        return ReferencePdfAnalysis(
+            page_kind="text_pdf_manual",
+            page_title=title,
+            page_count=len(page_texts),
+            rows_detected=len(rows),
+            detected_models=detected_models,
+            detected_part_numbers=detected_part_numbers,
+            guidance="This PDF contains extractable text and explicit part references that can be imported.",
+        )
+
+    return ReferencePdfAnalysis(
+        page_kind="text_pdf_no_parts",
+        page_title=title,
+        page_count=len(page_texts),
+        rows_detected=0,
+        detected_models=detected_models,
+        detected_part_numbers=[],
+        guidance="This PDF contains extractable text, but no explicit part numbers were detected for first-pass import.",
+    )
+
+
+def analyze_reference_pdf(
+    pdf_bytes: bytes,
+    page_url: str,
+    document_title: str = "",
+) -> ReferencePdfAnalysis:
+    page_texts = _extract_pdf_page_texts(pdf_bytes)
+    return analyze_reference_pdf_pages(page_texts, page_url, document_title=document_title)
+
+
+def parse_reference_pdf(
+    pdf_bytes: bytes,
+    page_url: str,
+    document_title: str = "",
+) -> list[dict[str, object]]:
+    page_texts = _extract_pdf_page_texts(pdf_bytes)
+    return parse_reference_pdf_pages(page_texts, page_url, document_title=document_title)
+
+
+def import_reference_pdf(
+    conn: sqlite3.Connection,
+    pdf_bytes: bytes,
+    page_url: str,
+    source_name: str = "PDF Manual",
+    source_type: str = "saved_pdf",
+    document_title: str = "",
+) -> ReferenceImportResult:
+    page_texts = _extract_pdf_page_texts(pdf_bytes)
+    analysis = analyze_reference_pdf_pages(page_texts, page_url, document_title=document_title)
+    if analysis.page_kind == "empty_or_scanned_pdf":
+        raise RuntimeError(
+            "No extractable text was found in this PDF. First-pass PDF support only handles text-based PDFs."
+        )
+    if analysis.page_kind == "text_pdf_no_parts":
+        raise RuntimeError(
+            "This PDF contains readable text, but no explicit part numbers were detected. "
+            "First-pass PDF import only creates reference rows when the manual lists option, spare, or assembly part numbers."
+        )
+
+    rows = parse_reference_pdf_pages(page_texts, page_url, document_title=document_title)
+    return import_reference_rows(
+        conn,
+        rows=rows,
+        source_name=source_name,
+        source_type=source_type,
+        source_url=page_url,
+    )
 
 
 def extract_harddrivesdirect_listing_links(html: str, page_url: str) -> list[str]:

@@ -7,7 +7,7 @@ import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, recent_import_runs, summarize_import
-from modules.reference_import import analyze_reference_html, import_reference_html, import_reference_rows, import_reference_url
+from modules.reference_import import analyze_reference_html, analyze_reference_pdf, import_reference_html, import_reference_pdf, import_reference_rows, import_reference_url, parse_reference_pdf
 from modules.reference_search import compatibility_reference_summary, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 from modules.search import recent_transactions, search_inventory, search_inventory_records, transactions_for_import_run
 
@@ -420,6 +420,85 @@ with compatibility_tab:
         else:
             st.success(
                 "Saved HTML import completed. "
+                f"Parsed {result.rows_seen} rows, added {result.models_upserted} models, "
+                f"{result.parts_upserted} parts, and {result.compatibilities_upserted} compatibility links."
+            )
+
+    st.caption("Text-based service manuals or specification PDFs can also be analyzed. This first pass only imports explicit part references found in the PDF text.")
+
+    saved_pdf_file = st.file_uploader(
+        "Saved service manual PDF",
+        type=["pdf"],
+        key="compatibility_saved_pdf",
+    )
+    saved_pdf_bytes = b""
+    saved_pdf_analysis = None
+    saved_pdf_preview_rows: list[dict[str, object]] = []
+    if saved_pdf_file is not None:
+        saved_pdf_bytes = saved_pdf_file.getvalue()
+        try:
+            saved_pdf_analysis = analyze_reference_pdf(
+                saved_pdf_bytes,
+                reference_url.strip() or saved_pdf_file.name,
+                document_title=saved_pdf_file.name,
+            )
+            saved_pdf_preview_rows = parse_reference_pdf(
+                saved_pdf_bytes,
+                reference_url.strip() or saved_pdf_file.name,
+                document_title=saved_pdf_file.name,
+            )
+        except Exception as exc:
+            st.error(f"Saved PDF analysis failed: {exc}")
+        else:
+            st.write("Saved PDF analysis:")
+            pdf_columns = st.columns(4)
+            pdf_columns[0].metric("Document type", saved_pdf_analysis.page_kind.replace("_", " ").title())
+            pdf_columns[1].metric("Pages", saved_pdf_analysis.page_count)
+            pdf_columns[2].metric("Detected rows", saved_pdf_analysis.rows_detected)
+            pdf_columns[3].metric("Detected models", len(saved_pdf_analysis.detected_models))
+            st.caption(saved_pdf_analysis.guidance)
+
+            if saved_pdf_analysis.detected_models:
+                st.write("Detected models from PDF:")
+                st.dataframe(pd.DataFrame({"model": saved_pdf_analysis.detected_models}), use_container_width=True)
+
+            if saved_pdf_analysis.detected_part_numbers:
+                st.write("Detected part numbers from PDF:")
+                st.dataframe(pd.DataFrame({"part_number": saved_pdf_analysis.detected_part_numbers}), use_container_width=True)
+
+            if saved_pdf_preview_rows:
+                st.write("PDF rows ready to import:")
+                preview_df = pd.DataFrame(
+                    [
+                        {
+                            "part_number": row.get("part_number", ""),
+                            "description": row.get("description", ""),
+                            "models": ", ".join(str(model) for model in row.get("system_models", [])),
+                            "page": (row.get("attributes") or {}).get("source_page", ""),
+                            "section": (row.get("attributes") or {}).get("document_section", ""),
+                        }
+                        for row in saved_pdf_preview_rows[:100]
+                    ]
+                )
+                st.dataframe(preview_df, use_container_width=True)
+                if len(saved_pdf_preview_rows) > 100:
+                    st.caption(f"Showing first 100 of {len(saved_pdf_preview_rows)} parsed PDF rows.")
+
+    if saved_pdf_file is not None and st.button("Import saved PDF manual", key="import_saved_compatibility_pdf"):
+        try:
+            with get_connection() as conn:
+                result = import_reference_pdf(
+                    conn,
+                    pdf_bytes=saved_pdf_bytes,
+                    page_url=reference_url.strip() or saved_pdf_file.name,
+                    source_name=reference_source_name.strip() or "PDF Manual",
+                    document_title=saved_pdf_file.name,
+                )
+        except Exception as exc:
+            st.error(f"Saved PDF compatibility import failed: {exc}")
+        else:
+            st.success(
+                "Saved PDF import completed. "
                 f"Parsed {result.rows_seen} rows, added {result.models_upserted} models, "
                 f"{result.parts_upserted} parts, and {result.compatibilities_upserted} compatibility links."
             )
