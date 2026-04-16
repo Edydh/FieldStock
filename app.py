@@ -7,7 +7,7 @@ import streamlit as st
 
 from modules.db import get_connection, initialize_database, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, DEFAULT_COLUMN_MAP, import_snapshot, read_excel_preview, recent_import_runs, summarize_import
-from modules.reference_import import analyze_reference_html, analyze_reference_pdf, import_reference_html, import_reference_pdf, import_reference_rows, import_reference_url, parse_reference_pdf
+from modules.reference_import import analyze_reference_html, analyze_reference_pdf, import_reference_html, import_reference_pdf, import_reference_rows, import_reference_url, parse_reference_pdf, repair_compatibility_model_links
 from modules.reference_search import compatibility_reference_summary, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 from modules.search import recent_transactions, search_inventory, search_inventory_records, transactions_for_import_run
 
@@ -297,6 +297,21 @@ with compatibility_tab:
             "No compatibility reference data has been imported yet. The matching system-model list stays empty until you import a saved HTML listing or a manual CSV/Excel reference file."
         )
 
+    st.markdown("#### Compatibility Maintenance")
+    st.caption("Repair older imported compatibility rows after parser improvements such as Gen8 to G8 normalization.")
+    if st.button("Repair existing compatibility model links", key="repair_compatibility_model_links"):
+        try:
+            with get_connection() as conn:
+                repair_result = repair_compatibility_model_links(conn)
+        except Exception as exc:
+            st.error(f"Compatibility repair failed: {exc}")
+        else:
+            st.success(
+                "Compatibility repair completed. "
+                f"Scanned {repair_result.compatibilities_scanned} links, added {repair_result.models_upserted} model(s), "
+                f"and created {repair_result.compatibilities_upserted} compatibility link(s)."
+            )
+
     if priority_rows:
         priority_df = pd.DataFrame(priority_rows)
         st.dataframe(
@@ -557,27 +572,39 @@ with compatibility_tab:
     )
     compatibility_available_only = st.checkbox(
         "Only show related parts that are in stock",
-        value=True,
-        key="compatibility_available_only",
+        value=False,
+        key="compatibility_available_only_v2",
     )
 
     if compatibility_query.strip():
         with get_connection() as conn:
+            all_compatibility_rows = search_related_compatibility(
+                conn,
+                compatibility_query.strip(),
+                available_only=False,
+                limit=300,
+            )
             compatibility_rows = search_related_compatibility(
                 conn,
                 compatibility_query.strip(),
                 available_only=compatibility_available_only,
                 limit=300,
             )
+            hidden_compatibility_rows = []
+            if compatibility_available_only and not compatibility_rows:
+                hidden_compatibility_rows = all_compatibility_rows[:25]
             model_rows = search_system_models(conn, compatibility_query.strip(), limit=25)
             reference_part_rows = search_reference_parts(conn, compatibility_query.strip(), available_only=False, limit=50)
             inventory_detected_rows = search_inventory_detected_models(conn, compatibility_query.strip(), limit=10)
 
         metric_columns = st.columns(4)
-        metric_columns[0].metric("Related rows", len(compatibility_rows))
+        metric_columns[0].metric("Related rows", len(all_compatibility_rows))
         metric_columns[1].metric("Imported models", len(model_rows))
         metric_columns[2].metric("Reference parts", len(reference_part_rows))
         metric_columns[3].metric("Inventory models", len(inventory_detected_rows))
+
+        if compatibility_available_only:
+            st.caption(f"Showing {len(compatibility_rows)} in-stock compatibility row(s) out of {len(all_compatibility_rows)} total match(es).")
 
         if compatibility_rows:
             compatibility_df = pd.DataFrame([dict(row) for row in compatibility_rows])
@@ -585,6 +612,12 @@ with compatibility_tab:
             st.dataframe(compatibility_df, use_container_width=True)
         else:
             st.info("No related compatibility rows matched this search.")
+            if hidden_compatibility_rows:
+                st.caption(
+                    f"{len(hidden_compatibility_rows)} related compatibility row(s) exist, but they are currently hidden by the in-stock filter."
+                )
+                with st.expander("Compatibility rows hidden by stock filter", expanded=False):
+                    st.dataframe(pd.DataFrame([dict(row) for row in hidden_compatibility_rows]), use_container_width=True)
 
         with st.expander("Matching imported system models", expanded=False):
             if model_rows:

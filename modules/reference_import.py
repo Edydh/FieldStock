@@ -38,6 +38,7 @@ MODEL_PATTERNS = [
 ]
 
 PART_NUMBER_PATTERN = re.compile(r"\b(?=[A-Z0-9-]*\d)[A-Z0-9]{4,10}-[A-Z0-9]{2,4}\b")
+GENERATION_TOKEN_PATTERN = re.compile(r"\b(?:GEN(?:ERATION)?\s*|G)(\d+)(?:\+)?\b", re.I)
 
 
 @dataclass(slots=True)
@@ -46,6 +47,13 @@ class ReferenceImportResult:
     parts_upserted: int
     models_upserted: int
     aliases_upserted: int
+    compatibilities_upserted: int
+
+
+@dataclass(slots=True)
+class CompatibilityModelRepairResult:
+    compatibilities_scanned: int
+    models_upserted: int
     compatibilities_upserted: int
 
 
@@ -99,6 +107,7 @@ PRODUCT_ATTRIBUTE_LABELS = {
 def extract_candidate_models(product_name: str) -> list[str]:
     cleaned = normalize_text(product_name)
     cleaned = re.sub(r"\(\s*(G\d+(?:\+)?)\s*\)", r" \1", cleaned)
+    cleaned = re.sub(r"\bGEN\s*(\d+)\b", r" G\1", cleaned)
     cleaned = re.sub(r"\bGENERATION\s+(\d+)\b", r" G\1", cleaned)
     cleaned = cleaned.replace("+", "")
     matches: list[str] = []
@@ -115,6 +124,37 @@ def extract_candidate_models(product_name: str) -> list[str]:
         seen.add(normalized)
         ordered.append(display_name)
     return ordered
+
+
+def _generation_tokens(value: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for match in GENERATION_TOKEN_PATTERN.finditer(normalize_text(value)):
+        token = f"G{match.group(1)}"
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _backfill_model_candidates(existing_model_name: str, context_text: str) -> list[str]:
+    normalized_model = normalize_model_name(existing_model_name)
+    if not normalized_model or re.search(r"G\d+", normalized_model):
+        return []
+    if re.search(r"\b(?:PROLIANT\s+)?(?:DL|ML|BL|SL)\d+[A-Z-]*\b", normalize_text(existing_model_name)) is None:
+        return []
+
+    generation_tokens = _generation_tokens(context_text)
+    if len(generation_tokens) != 1:
+        return []
+
+    generated_models = extract_candidate_models(f"{existing_model_name} {generation_tokens[0]}")
+    return [
+        model_name
+        for model_name in generated_models
+        if normalize_model_name(model_name) != normalized_model and re.search(r"G\d+", normalize_model_name(model_name))
+    ]
 
 
 def _is_likely_reference_part_number(candidate: str) -> bool:
@@ -441,6 +481,73 @@ def import_reference_rows(
         parts_upserted=parts_upserted,
         models_upserted=models_upserted,
         aliases_upserted=aliases_upserted,
+        compatibilities_upserted=compatibilities_upserted,
+    )
+
+
+def repair_compatibility_model_links(conn: sqlite3.Connection) -> CompatibilityModelRepairResult:
+    rows = conn.execute(
+        """
+        SELECT
+            spc.reference_part_id,
+            spc.source_id,
+            spc.evidence,
+            spc.source_url,
+            spc.confidence,
+            sm.manufacturer AS model_manufacturer,
+            sm.model_name,
+            rp.description AS reference_description,
+            rp.manufacturer AS reference_manufacturer,
+            rp.source_title
+        FROM system_part_compatibility spc
+        INNER JOIN system_models sm ON sm.id = spc.system_model_id
+        INNER JOIN reference_parts rp ON rp.id = spc.reference_part_id
+        ORDER BY spc.id ASC
+        """
+    ).fetchall()
+
+    models_upserted = 0
+    compatibilities_upserted = 0
+    for row in rows:
+        evidence = str(row["evidence"] or "").strip()
+        reference_description = str(row["reference_description"] or "").strip()
+        source_title = str(row["source_title"] or "").strip()
+        existing_model_name = str(row["model_name"] or "").strip()
+        manufacturer_guess = str(row["model_manufacturer"] or row["reference_manufacturer"] or "").strip()
+
+        candidate_models: list[str] = []
+        for text_value in (evidence, reference_description):
+            for model_name in extract_candidate_models(text_value):
+                if model_name not in candidate_models:
+                    candidate_models.append(model_name)
+
+        context_text = " ".join(value for value in (evidence, reference_description, source_title) if value)
+        for model_name in _backfill_model_candidates(existing_model_name, context_text):
+            if model_name not in candidate_models:
+                candidate_models.append(model_name)
+
+        for model_name in candidate_models:
+            system_model_id, model_inserted = _upsert_system_model(
+                conn,
+                manufacturer=manufacturer_guess,
+                model_name=model_name,
+                model_family=model_name,
+            )
+            models_upserted += int(model_inserted)
+            compatibility_inserted = _upsert_compatibility(
+                conn,
+                system_model_id=system_model_id,
+                reference_part_id=int(row["reference_part_id"]),
+                source_id=int(row["source_id"]),
+                evidence=evidence or reference_description,
+                source_url=str(row["source_url"] or ""),
+                confidence=float(row["confidence"] or 0.75),
+            )
+            compatibilities_upserted += int(compatibility_inserted)
+
+    return CompatibilityModelRepairResult(
+        compatibilities_scanned=len(rows),
+        models_upserted=models_upserted,
         compatibilities_upserted=compatibilities_upserted,
     )
 

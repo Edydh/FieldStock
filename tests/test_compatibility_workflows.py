@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_location, upsert_part
-from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, analyze_reference_pdf_pages, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_product_page, parse_harddrivesdirect_search_results, parse_reference_pdf_pages
+from modules.reference_import import ReferenceHtmlAnalysis, analyze_reference_html, analyze_reference_pdf_pages, extract_candidate_models, extract_harddrivesdirect_listing_links, extract_harddrivesdirect_page_models, import_reference_html, import_reference_rows, import_reference_url, parse_harddrivesdirect_listing, parse_harddrivesdirect_product_page, parse_harddrivesdirect_search_results, parse_reference_pdf_pages, repair_compatibility_model_links
 from modules.reference_search import compatibility_inventory_for_model, compatibility_source_summary, inventory_model_priority_matrix, search_inventory_detected_models, search_reference_parts, search_related_compatibility, search_system_models
 
 
@@ -772,6 +772,66 @@ def test_extract_candidate_models_handles_common_patterns() -> None:
     assert "DL560 G9" in models
     assert "G8 G9" in models
     assert "MSA2" in models
+
+
+def test_extract_candidate_models_normalizes_gen_shorthand() -> None:
+    models = extract_candidate_models("ProLiant DL380p Gen8 System Board")
+
+    assert "DL380P G8" in models
+
+
+def test_repair_compatibility_model_links_backfills_generation_specific_models(conn: sqlite3.Connection) -> None:
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "14900L-13",
+                "description": "HP 32GB memory module",
+                "manufacturer": "HPE",
+                "system_models": ["PROLIANT DL380P"],
+                "source_title": "HPE ProLiant Gen8 Servers - Part Number Memory Matrix",
+            }
+        ],
+        source_name="PDF Manual",
+        source_type="saved_pdf",
+        source_url="https://example.test/manual.pdf#page=6",
+    )
+
+    before_rows = search_related_compatibility(conn, "DL380P G8", available_only=False, limit=20)
+    repair_result = repair_compatibility_model_links(conn)
+    after_rows = search_related_compatibility(conn, "DL380P G8", available_only=False, limit=20)
+    repaired_models = search_system_models(conn, "DL380P G8", limit=20)
+
+    assert before_rows == []
+    assert repair_result.models_upserted >= 1
+    assert repair_result.compatibilities_upserted >= 1
+    assert after_rows
+    assert any(row["model_name"] == "DL380P G8" for row in repaired_models)
+
+
+def test_repair_compatibility_model_links_is_idempotent(conn: sqlite3.Connection) -> None:
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "14900L-13",
+                "description": "HP 32GB memory module",
+                "manufacturer": "HPE",
+                "system_models": ["PROLIANT DL380P"],
+                "source_title": "HPE ProLiant Gen8 Servers - Part Number Memory Matrix",
+            }
+        ],
+        source_name="PDF Manual",
+        source_type="saved_pdf",
+        source_url="https://example.test/manual.pdf#page=6",
+    )
+
+    first_result = repair_compatibility_model_links(conn)
+    second_result = repair_compatibility_model_links(conn)
+
+    assert first_result.compatibilities_upserted >= 1
+    assert second_result.models_upserted == 0
+    assert second_result.compatibilities_upserted == 0
 
 
 def test_inventory_model_priority_matrix_ranks_common_models(conn: sqlite3.Connection) -> None:
