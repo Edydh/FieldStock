@@ -3,13 +3,19 @@ from __future__ import annotations
 import sqlite3
 
 
-def _build_inventory_filters(query: str, available_only: bool) -> tuple[str, list[object]]:
+def _build_inventory_filters(
+    query: str,
+    available_only: bool,
+    include_reference_aliases: bool = False,
+) -> tuple[str, list[object]]:
     cleaned = query.strip()
     params: list[object] = []
     where_clauses: list[str] = []
 
     if cleaned:
-        where_clauses.append(
+        normalized_wildcard = f"%{''.join(ch for ch in cleaned.upper() if ch.isalnum())}%"
+        wildcard = f"%{cleaned}%"
+        search_conditions = [
             """
             (
                 p.part_number LIKE ? OR
@@ -17,10 +23,40 @@ def _build_inventory_filters(query: str, available_only: bool) -> tuple[str, lis
                 p.normalized_part_number LIKE ?
             )
             """
-        )
-        wildcard = f"%{cleaned}%"
-        normalized_wildcard = f"%{''.join(ch for ch in cleaned.upper() if ch.isalnum())}%"
+        ]
         params.extend([wildcard, wildcard, normalized_wildcard])
+
+        if include_reference_aliases:
+            search_conditions.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM reference_parts rp
+                    LEFT JOIN reference_part_aliases rpa ON rpa.reference_part_id = rp.id
+                    WHERE (
+                        rp.normalized_part_number = p.normalized_part_number
+                        OR rpa.normalized_alias_part_number = p.normalized_part_number
+                    )
+                    AND (
+                        UPPER(rp.part_number) LIKE ?
+                        OR UPPER(COALESCE(rp.description, '')) LIKE ?
+                        OR UPPER(COALESCE(rpa.alias_part_number, '')) LIKE ?
+                        OR REPLACE(UPPER(rp.part_number), '-', '') LIKE '%' || ? || '%'
+                        OR REPLACE(UPPER(COALESCE(rpa.alias_part_number, '')), '-', '') LIKE '%' || ? || '%'
+                    )
+                )
+                """
+            )
+            upper_wildcard = f"%{cleaned.upper()}%"
+            params.extend([
+                upper_wildcard,
+                upper_wildcard,
+                upper_wildcard,
+                normalized_wildcard.strip('%'),
+                normalized_wildcard.strip('%'),
+            ])
+
+        where_clauses.append("(" + " OR ".join(search_conditions) + ")")
 
     if available_only:
         where_clauses.append("ib.qty_on_hand > 0")
@@ -33,8 +69,13 @@ def search_inventory(
     query: str,
     available_only: bool = True,
     limit: int = 100,
+    include_reference_aliases: bool = False,
 ) -> list[sqlite3.Row]:
-    where_sql, params = _build_inventory_filters(query, available_only)
+    where_sql, params = _build_inventory_filters(
+        query,
+        available_only,
+        include_reference_aliases=include_reference_aliases,
+    )
     params.append(limit)
 
     return conn.execute(

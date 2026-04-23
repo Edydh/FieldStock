@@ -9,6 +9,7 @@ import pytest
 
 from modules.db import SCHEMA_PATH, record_inventory_adjustment
 from modules.import_excel import analyze_snapshot_import, import_snapshot, recent_import_runs, summarize_import
+from modules.reference_import import import_reference_rows
 from modules.search import recent_transactions, search_inventory, transactions_for_import_run
 
 
@@ -340,6 +341,62 @@ def test_snapshot_import_stores_oem_in_search_results(conn: sqlite3.Connection) 
     assert row["manufacturer"] == "Samsung"
     assert len(rows) == 1
     assert rows[0]["oem"] == "Samsung"
+
+
+def test_search_inventory_matches_reference_aliases_when_enabled(conn: sqlite3.Connection) -> None:
+    file_bytes = make_excel_bytes(
+        [
+            {
+                "Product identification": "872737001",
+                "Product name": "Drive 1.2TB",
+                "OEM": "HPE",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 5,
+            }
+        ]
+    )
+    import_snapshot(
+        conn=conn,
+        file_bytes=file_bytes,
+        column_map=None,
+        created_by="tester",
+        reference="import-001",
+    )
+
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "872737-001",
+                "description": "HP G8 G9 1.2-TB 12G 10K 2.5 SAS SC",
+                "manufacturer": "HPE",
+                "system_models": ["G8 G9"],
+                "aliases": ["872479-B21", "872479-S21", "876936-002"],
+            }
+        ],
+        source_name="HardDrivesDirect",
+        source_type="web_listing",
+        source_url="https://example.test/hp",
+    )
+
+    rows_without_alias = search_inventory(
+        conn,
+        query="872479-B21",
+        available_only=True,
+        include_reference_aliases=False,
+    )
+    rows_with_alias = search_inventory(
+        conn,
+        query="872479-B21",
+        available_only=True,
+        include_reference_aliases=True,
+    )
+
+    assert rows_without_alias == []
+    assert len(rows_with_alias) == 1
+    assert rows_with_alias[0]["part_number"] == "872737001"
 
 
 def test_analyze_snapshot_import_summarizes_expected_balance_changes(conn: sqlite3.Connection) -> None:

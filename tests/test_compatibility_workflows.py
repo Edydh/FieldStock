@@ -217,6 +217,7 @@ def test_search_reference_parts_matches_part_number_and_alias(conn: sqlite3.Conn
     assert rows[0]["local_part_number"] == "872737001"
     assert rows[0]["match_status"] == "Matched in inventory"
     assert int(rows[0]["compatible_model_count"]) == 1
+    assert "872737001" in rows[0]["alias_part_numbers"]
 
 
 def test_search_system_models_returns_browse_results_when_query_empty(conn: sqlite3.Connection) -> None:
@@ -291,6 +292,8 @@ def test_search_related_compatibility_expands_from_matched_part_to_related_model
     assert "872737-001" in reference_part_numbers
     assert "830287-B21" in reference_part_numbers
     assert any(row["relation_type"] == "Matched reference part" for row in rows)
+    matched_row = next(row for row in rows if row["reference_part_number"] == "872737-001")
+    assert "872737001" in matched_row["alias_part_numbers"]
 
 
 def test_parse_harddrivesdirect_listing_extracts_rows_and_models() -> None:

@@ -285,6 +285,7 @@ def search_reference_parts(
             rp.product_url,
             COALESCE(mc.compatible_model_count, 0) AS compatible_model_count,
             COALESCE(mc.compatible_models, '') AS compatible_models,
+            COALESCE(GROUP_CONCAT(DISTINCT NULLIF(rpa.alias_part_number, '')), '') AS alias_part_numbers,
             local_inventory.local_part_number,
             local_inventory.local_description,
             local_inventory.local_oem,
@@ -386,6 +387,13 @@ def search_related_compatibility(
                 rpa.normalized_alias_part_number AS normalized_value
             FROM reference_part_aliases rpa
         ),
+        alias_agg AS (
+            SELECT
+                reference_part_id,
+                GROUP_CONCAT(DISTINCT NULLIF(alias_part_number, '')) AS alias_part_numbers
+            FROM reference_part_aliases
+            GROUP BY reference_part_id
+        ),
         local_inventory AS (
             SELECT
                 p.normalized_part_number,
@@ -411,6 +419,7 @@ def search_related_compatibility(
             rs.source_name,
             spc.source_url,
             spc.confidence,
+            COALESCE(aa.alias_part_numbers, '') AS alias_part_numbers,
             local_inventory.local_part_number,
             local_inventory.local_description,
             local_inventory.local_oem,
@@ -428,6 +437,7 @@ def search_related_compatibility(
         INNER JOIN system_models sm ON sm.id = spc.system_model_id
         INNER JOIN reference_parts rp ON rp.id = spc.reference_part_id
         INNER JOIN reference_sources rs ON rs.id = spc.source_id
+        LEFT JOIN alias_agg aa ON aa.reference_part_id = rp.id
         LEFT JOIN reference_candidates rc ON rc.reference_part_id = rp.id
         LEFT JOIN local_inventory ON local_inventory.normalized_part_number = rc.normalized_value
         WHERE 1 = 1
@@ -443,6 +453,7 @@ def search_related_compatibility(
             rs.source_name,
             spc.source_url,
             spc.confidence,
+            aa.alias_part_numbers,
             local_inventory.local_part_number,
             local_inventory.local_description,
             local_inventory.local_oem,

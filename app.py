@@ -214,11 +214,17 @@ with import_tab:
 
 with search_tab:
     st.subheader("Inventory Search")
-    query = st.text_input("Search by part number or description")
+    query = st.text_input("Search by part number, alias, or description")
     available_only = st.checkbox("Available stock only", value=True)
 
     with get_connection() as conn:
-        rows = search_inventory(conn, query=query, available_only=available_only, limit=200)
+        rows = search_inventory(
+            conn,
+            query=query,
+            available_only=available_only,
+            limit=200,
+            include_reference_aliases=True,
+        )
         transactions = recent_transactions(conn)
 
     if rows:
@@ -570,6 +576,7 @@ with compatibility_tab:
         placeholder="Examples: DL560 G9, 872737-001, R640",
         key="compatibility_query",
     )
+    st.caption("Compatibility = part fits a system model. Alternative/Alias part number = same part family with a different identifier.")
     compatibility_available_only = st.checkbox(
         "Only show related parts that are in stock",
         value=False,
@@ -609,7 +616,19 @@ with compatibility_tab:
         if compatibility_rows:
             compatibility_df = pd.DataFrame([dict(row) for row in compatibility_rows])
             st.write("Related compatibility results:")
-            st.dataframe(compatibility_df, use_container_width=True)
+            preferred_columns = [
+                "model_name",
+                "reference_part_number",
+                "alias_part_numbers",
+                "reference_description",
+                "reference_manufacturer",
+                "source_name",
+                "qty_on_hand",
+                "match_status",
+                "relation_type",
+            ]
+            display_columns = [column for column in preferred_columns if column in compatibility_df.columns]
+            st.dataframe(compatibility_df[display_columns], use_container_width=True)
         else:
             st.info("No related compatibility rows matched this search.")
             if hidden_compatibility_rows:
@@ -627,7 +646,20 @@ with compatibility_tab:
 
         with st.expander("Matching imported reference parts", expanded=False):
             if reference_part_rows:
-                st.dataframe(pd.DataFrame([dict(row) for row in reference_part_rows]), use_container_width=True)
+                reference_df = pd.DataFrame([dict(row) for row in reference_part_rows])
+                preferred_columns = [
+                    "reference_part_number",
+                    "alias_part_numbers",
+                    "reference_description",
+                    "reference_manufacturer",
+                    "compatible_model_count",
+                    "compatible_models",
+                    "local_part_number",
+                    "qty_on_hand",
+                    "match_status",
+                ]
+                display_columns = [column for column in preferred_columns if column in reference_df.columns]
+                st.dataframe(reference_df[display_columns], use_container_width=True)
             else:
                 st.info("No imported reference parts matched this search.")
 
