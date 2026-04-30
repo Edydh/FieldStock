@@ -461,15 +461,24 @@ def test_search_inventory_surfaces_local_alternative_part_numbers_without_refere
         created_by="tester",
         reference="seed-local-001",
     )
-    upsert_local_part_aliases(conn, part_id=part_id, aliases=["10DXV", "K4PPV", "KVY4F"])
+    upsert_local_part_aliases(
+        conn,
+        part_id=part_id,
+        aliases=["10DXV", "010DXV", "K4PPV", "0K4PPV", "KVY4F", "0KVY4F", "0FK6YW", "M1GND"],
+    )
 
     rows = search_inventory(conn, query="FK6YW", available_only=True, include_reference_aliases=True)
 
     assert rows
     assert rows[0]["part_number"] == "FK6YW"
     assert "10DXV" in rows[0]["alternative_part_numbers"]
+    assert "010DXV" in rows[0]["alternative_part_numbers"]
     assert "K4PPV" in rows[0]["alternative_part_numbers"]
+    assert "0K4PPV" in rows[0]["alternative_part_numbers"]
     assert "KVY4F" in rows[0]["alternative_part_numbers"]
+    assert "0KVY4F" in rows[0]["alternative_part_numbers"]
+    assert "0FK6YW" in rows[0]["alternative_part_numbers"]
+    assert "M1GND" in rows[0]["alternative_part_numbers"]
 
 
 def test_search_inventory_matches_local_alias_when_alias_search_enabled(conn: sqlite3.Connection) -> None:
@@ -497,6 +506,34 @@ def test_search_inventory_matches_local_alias_when_alias_search_enabled(conn: sq
     assert rows_without_alias == []
     assert rows_with_alias
     assert rows_with_alias[0]["part_number"] == "FK6YW"
+
+
+def test_search_inventory_matches_zero_prefixed_local_alias_when_alias_search_enabled(conn: sqlite3.Connection) -> None:
+    part_id = upsert_part(
+        conn,
+        part_number="FK6YW",
+        description="6.6V L-ion Battery 6.93W 1.05AH Cntlr Type 15/19",
+        manufacturer="Dell",
+        uom="EA",
+    )
+    location_id = upsert_location(conn, "MAIN", "A1")
+    record_inventory_adjustment(
+        conn=conn,
+        part_id=part_id,
+        location_id=location_id,
+        qty_change=1.0,
+        created_by="tester",
+        reference="seed-local-003",
+    )
+    upsert_local_part_aliases(conn, part_id=part_id, aliases=["010DXV", "M1GND"])
+
+    rows_for_zero_prefixed = search_inventory(conn, query="010DXV", available_only=True, include_reference_aliases=True)
+    rows_for_additional_alias = search_inventory(conn, query="M1GND", available_only=True, include_reference_aliases=True)
+
+    assert rows_for_zero_prefixed
+    assert rows_for_zero_prefixed[0]["part_number"] == "FK6YW"
+    assert rows_for_additional_alias
+    assert rows_for_additional_alias[0]["part_number"] == "FK6YW"
 
 
 def test_analyze_snapshot_import_summarizes_expected_balance_changes(conn: sqlite3.Connection) -> None:

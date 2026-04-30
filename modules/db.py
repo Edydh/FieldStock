@@ -15,7 +15,7 @@ SCHEMA_PATH = BASE_DIR / "db" / "schema.sql"
 # Curated local aliases that should be visible in inventory search even when
 # external reference imports are incomplete.
 DEFAULT_LOCAL_PART_ALIASES: dict[str, list[str]] = {
-    "FK6YW": ["10DXV", "K4PPV", "KVY4F"],
+    "FK6YW": ["10DXV", "010DXV", "K4PPV", "0K4PPV", "KVY4F", "0KVY4F", "0FK6YW", "M1GND"],
 }
 
 SQLITE_TIMEOUT_SECONDS = 30
