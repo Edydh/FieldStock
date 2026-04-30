@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -17,20 +18,35 @@ DEFAULT_LOCAL_PART_ALIASES: dict[str, list[str]] = {
     "FK6YW": ["10DXV", "K4PPV", "KVY4F"],
 }
 
+SQLITE_TIMEOUT_SECONDS = 30
+SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
+
+_INITIALIZE_LOCK = threading.Lock()
+_DATABASE_INITIALIZED = False
+
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def initialize_database() -> None:
+    global _DATABASE_INITIALIZED
+    if _DATABASE_INITIALIZED:
+        return
+
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
-    with get_connection() as conn:
-        conn.executescript(schema)
-        ensure_default_local_aliases(conn)
+    with _INITIALIZE_LOCK:
+        if _DATABASE_INITIALIZED:
+            return
+        with get_connection() as conn:
+            conn.executescript(schema)
+            ensure_default_local_aliases(conn)
+        _DATABASE_INITIALIZED = True
 
 
 def upsert_part(
