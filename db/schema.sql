@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
     FOREIGN KEY(location_id) REFERENCES locations(id)
 );
 
+CREATE TABLE IF NOT EXISTS local_part_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_id INTEGER NOT NULL,
+    alias_part_number TEXT NOT NULL,
+    normalized_alias_part_number TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(part_id, normalized_alias_part_number),
+    FOREIGN KEY(part_id) REFERENCES parts(id)
+);
+
 CREATE TABLE IF NOT EXISTS import_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     reference TEXT NOT NULL,
@@ -167,6 +177,8 @@ CREATE INDEX IF NOT EXISTS idx_inventory_balances_location_id ON inventory_balan
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_part_id ON inventory_transactions(part_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_location_id ON inventory_transactions(location_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_transactions_created_at ON inventory_transactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_local_part_aliases_part_id ON local_part_aliases(part_id);
+CREATE INDEX IF NOT EXISTS idx_local_part_aliases_normalized_alias_part_number ON local_part_aliases(normalized_alias_part_number);
 CREATE INDEX IF NOT EXISTS idx_import_runs_created_at ON import_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_system_models_normalized_model_name ON system_models(normalized_model_name);
 CREATE INDEX IF NOT EXISTS idx_reference_parts_normalized_part_number ON reference_parts(normalized_part_number);

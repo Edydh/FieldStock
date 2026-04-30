@@ -228,8 +228,25 @@ with search_tab:
         transactions = recent_transactions(conn)
 
     if rows:
-        search_results_df = pd.DataFrame([dict(row) for row in rows]).rename(columns={"oem": "OEM"})
-        st.dataframe(search_results_df, use_container_width=True)
+        search_results_df = pd.DataFrame([dict(row) for row in rows]).rename(
+            columns={
+                "oem": "OEM",
+                "alternative_part_numbers": "Alternative Part Numbers",
+            }
+        )
+        preferred_columns = [
+            "part_number",
+            "Alternative Part Numbers",
+            "description",
+            "OEM",
+            "uom",
+            "warehouse_code",
+            "location_code",
+            "qty_on_hand",
+            "updated_at",
+        ]
+        display_columns = [column for column in preferred_columns if column in search_results_df.columns]
+        st.dataframe(search_results_df[display_columns], use_container_width=True)
     else:
         st.info("No inventory rows matched the current search.")
 

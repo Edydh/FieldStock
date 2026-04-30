@@ -11,6 +11,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "db" / "fieldstock.db"
 SCHEMA_PATH = BASE_DIR / "db" / "schema.sql"
 
+# Curated local aliases that should be visible in inventory search even when
+# external reference imports are incomplete.
+DEFAULT_LOCAL_PART_ALIASES: dict[str, list[str]] = {
+    "FK6YW": ["10DXV", "K4PPV", "KVY4F"],
+}
+
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -24,6 +30,7 @@ def initialize_database() -> None:
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with get_connection() as conn:
         conn.executescript(schema)
+        ensure_default_local_aliases(conn)
 
 
 def upsert_part(
@@ -90,6 +97,44 @@ def upsert_location(conn: sqlite3.Connection, warehouse_code: str, location_code
         (normalized_warehouse, normalized_location),
     ).fetchone()
     return int(row["id"])
+
+
+def upsert_local_part_aliases(
+    conn: sqlite3.Connection,
+    part_id: int,
+    aliases: Iterable[str],
+) -> int:
+    inserted = 0
+    for alias in aliases:
+        normalized_alias = normalize_part_number(alias)
+        if not normalized_alias:
+            continue
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO local_part_aliases (
+                part_id,
+                alias_part_number,
+                normalized_alias_part_number
+            ) VALUES (?, ?, ?)
+            """,
+            (part_id, str(alias).strip(), normalized_alias),
+        )
+        if cursor.rowcount > 0:
+            inserted += 1
+    return inserted
+
+
+def ensure_default_local_aliases(conn: sqlite3.Connection) -> int:
+    inserted = 0
+    for canonical_part, aliases in DEFAULT_LOCAL_PART_ALIASES.items():
+        row = conn.execute(
+            "SELECT id FROM parts WHERE normalized_part_number = ?",
+            (normalize_part_number(canonical_part),),
+        ).fetchone()
+        if row is None:
+            continue
+        inserted += upsert_local_part_aliases(conn, int(row["id"]), aliases)
+    return inserted
 
 
 def set_inventory_balance(

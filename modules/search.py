@@ -47,12 +47,27 @@ def _build_inventory_filters(
                 )
                 """
             )
+            search_conditions.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM local_part_aliases lpa
+                    WHERE lpa.part_id = p.id
+                    AND (
+                        UPPER(lpa.alias_part_number) LIKE ?
+                        OR REPLACE(UPPER(lpa.alias_part_number), '-', '') LIKE '%' || ? || '%'
+                    )
+                )
+                """
+            )
             upper_wildcard = f"%{cleaned.upper()}%"
             params.extend([
                 upper_wildcard,
                 upper_wildcard,
                 upper_wildcard,
                 normalized_wildcard.strip('%'),
+                normalized_wildcard.strip('%'),
+                upper_wildcard,
                 normalized_wildcard.strip('%'),
             ])
 
@@ -85,6 +100,36 @@ def search_inventory(
             p.description,
             p.manufacturer AS oem,
             p.uom,
+            COALESCE((
+                SELECT GROUP_CONCAT(DISTINCT candidate.part_number)
+                FROM (
+                    SELECT rp.part_number, rp.normalized_part_number AS normalized_value
+                    FROM reference_parts rp
+                    WHERE rp.normalized_part_number = p.normalized_part_number
+                       OR EXISTS (
+                            SELECT 1
+                            FROM reference_part_aliases rpa_match
+                            WHERE rpa_match.reference_part_id = rp.id
+                              AND rpa_match.normalized_alias_part_number = p.normalized_part_number
+                       )
+                    UNION
+                    SELECT rpa.alias_part_number AS part_number, rpa.normalized_alias_part_number AS normalized_value
+                    FROM reference_part_aliases rpa
+                    INNER JOIN reference_parts rp ON rp.id = rpa.reference_part_id
+                    WHERE rp.normalized_part_number = p.normalized_part_number
+                       OR EXISTS (
+                            SELECT 1
+                            FROM reference_part_aliases rpa_match
+                            WHERE rpa_match.reference_part_id = rp.id
+                              AND rpa_match.normalized_alias_part_number = p.normalized_part_number
+                       )
+                          UNION
+                          SELECT lpa.alias_part_number AS part_number, lpa.normalized_alias_part_number AS normalized_value
+                          FROM local_part_aliases lpa
+                          WHERE lpa.part_id = p.id
+                ) candidate
+                WHERE candidate.normalized_value <> p.normalized_part_number
+            ), '') AS alternative_part_numbers,
             l.warehouse_code,
             l.location_code,
             ib.qty_on_hand,

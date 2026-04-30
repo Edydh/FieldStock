@@ -7,7 +7,7 @@ from typing import Iterator
 import pandas as pd
 import pytest
 
-from modules.db import SCHEMA_PATH, record_inventory_adjustment
+from modules.db import SCHEMA_PATH, record_inventory_adjustment, upsert_local_part_aliases, upsert_location, upsert_part
 from modules.import_excel import analyze_snapshot_import, import_snapshot, recent_import_runs, summarize_import
 from modules.reference_import import import_reference_rows
 from modules.search import recent_transactions, search_inventory, transactions_for_import_run
@@ -397,6 +397,106 @@ def test_search_inventory_matches_reference_aliases_when_enabled(conn: sqlite3.C
     assert rows_without_alias == []
     assert len(rows_with_alias) == 1
     assert rows_with_alias[0]["part_number"] == "872737001"
+
+
+def test_search_inventory_surfaces_alternative_part_numbers(conn: sqlite3.Connection) -> None:
+    file_bytes = make_excel_bytes(
+        [
+            {
+                "Product identification": "FK6YW",
+                "Product name": "Dell drive carrier",
+                "OEM": "Dell",
+                "Warehouse": "Main",
+                "Location": "A1",
+                "Inventory unit": "EA",
+                "Total available": 2,
+            }
+        ]
+    )
+    import_snapshot(
+        conn=conn,
+        file_bytes=file_bytes,
+        column_map=None,
+        created_by="tester",
+        reference="import-002",
+    )
+
+    import_reference_rows(
+        conn,
+        rows=[
+            {
+                "part_number": "FK6YW",
+                "description": "Dell carrier",
+                "manufacturer": "Dell",
+                "system_models": ["R640"],
+                "aliases": ["10DXV"],
+            }
+        ],
+        source_name="Manual Upload",
+        source_type="manual_file",
+        source_url="manual.csv",
+    )
+
+    rows = search_inventory(conn, query="FK6YW", available_only=True, include_reference_aliases=True)
+
+    assert rows
+    assert rows[0]["part_number"] == "FK6YW"
+    assert "10DXV" in rows[0]["alternative_part_numbers"]
+
+
+def test_search_inventory_surfaces_local_alternative_part_numbers_without_reference_rows(conn: sqlite3.Connection) -> None:
+    part_id = upsert_part(
+        conn,
+        part_number="FK6YW",
+        description="6.6V L-ion Battery 6.93W 1.05AH Cntlr Type 15/19",
+        manufacturer="Dell",
+        uom="EA",
+    )
+    location_id = upsert_location(conn, "MAIN", "A1")
+    record_inventory_adjustment(
+        conn=conn,
+        part_id=part_id,
+        location_id=location_id,
+        qty_change=1.0,
+        created_by="tester",
+        reference="seed-local-001",
+    )
+    upsert_local_part_aliases(conn, part_id=part_id, aliases=["10DXV", "K4PPV", "KVY4F"])
+
+    rows = search_inventory(conn, query="FK6YW", available_only=True, include_reference_aliases=True)
+
+    assert rows
+    assert rows[0]["part_number"] == "FK6YW"
+    assert "10DXV" in rows[0]["alternative_part_numbers"]
+    assert "K4PPV" in rows[0]["alternative_part_numbers"]
+    assert "KVY4F" in rows[0]["alternative_part_numbers"]
+
+
+def test_search_inventory_matches_local_alias_when_alias_search_enabled(conn: sqlite3.Connection) -> None:
+    part_id = upsert_part(
+        conn,
+        part_number="FK6YW",
+        description="6.6V L-ion Battery 6.93W 1.05AH Cntlr Type 15/19",
+        manufacturer="Dell",
+        uom="EA",
+    )
+    location_id = upsert_location(conn, "MAIN", "A1")
+    record_inventory_adjustment(
+        conn=conn,
+        part_id=part_id,
+        location_id=location_id,
+        qty_change=1.0,
+        created_by="tester",
+        reference="seed-local-002",
+    )
+    upsert_local_part_aliases(conn, part_id=part_id, aliases=["10DXV"])
+
+    rows_without_alias = search_inventory(conn, query="10DXV", available_only=True, include_reference_aliases=False)
+    rows_with_alias = search_inventory(conn, query="10DXV", available_only=True, include_reference_aliases=True)
+
+    assert rows_without_alias == []
+    assert rows_with_alias
+    assert rows_with_alias[0]["part_number"] == "FK6YW"
 
 
 def test_analyze_snapshot_import_summarizes_expected_balance_changes(conn: sqlite3.Connection) -> None:
