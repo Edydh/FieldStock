@@ -554,6 +554,197 @@ def test_parse_harddrivesdirect_product_page_extracts_aliases_and_attributes() -
         assert row["attributes"]["model_number"] == "MB1000BAWJP"
 
 
+def test_parse_harddrivesdirect_product_page_extracts_emc_aliases_and_models() -> None:
+        html = """
+        <html>
+            <head><title>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</title></head>
+            <body>
+                <h1>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</h1>
+                <p>
+                    Description: Genuine EMC 600GB 15K 3.5-inch 4GB FibreChannel (FC) Hot-Plug Hard Drive
+                    in 3.5-inch EMC Hot-Plug HDD Drive Tray (as pictured)
+                    Genuine EMC serial number and firmware
+                </p>
+                <p>
+                    Part Number(s)
+                    EMC Part# 005048952
+                    EMC Part# 005049033
+                    EMC Part# 005049118
+                    EMC Part# 005049160
+                    EMC Part# 005049694
+                    EMC Part# 005050919
+                    EMC Part# 005050920
+                    Model# CX-4G15-600
+                </p>
+                <p>
+                    Specifications:
+                    Category EMC HardDrive
+                    Sub-Category 15K
+                    Generation Fibre Channel
+                    Part Number 005049033
+                    Products ID 477385
+                    Capacity 600GB
+                    Form Factor 3.5 inches
+                    Interface Fibre Channel
+                    Rotational Speed 15000RPM
+                    Manufacturer Dell EMC
+                    Bytes/sector 520
+                    Hot Swap Tray Included
+                </p>
+                <p>
+                    005049033 Compatible Servers and Storage Arrays:
+                    For the EMC CX4 Series Storage Systems
+                </p>
+                <table>
+                    <tr><th>EMC VNX Hard Drives</th></tr>
+                    <tr><td>EMC VNX 5100</td><td>EMC VNX 5200</td></tr>
+                    <tr><td>EMC VNX 5300</td><td>EMC VNX 5400</td></tr>
+                    <tr><th>EMC VNXe Hard Drives</th></tr>
+                    <tr><td>EMC VNXe 3100</td><td>EMC VNXe 3150</td></tr>
+                    <tr><th>EMC CLARiiON CX3 Hard Drives</th></tr>
+                    <tr><td>EMC CX3 10</td><td>EMC CX3 20</td></tr>
+                    <tr><th>EMC CLARiiON CX4 Hard Drives</th></tr>
+                    <tr><td>EMC CX4 120</td><td>EMC CX4 240</td></tr>
+                    <tr><td>EMC CX4 480</td><td>EMC CX4 960</td></tr>
+                </table>
+            </body>
+        </html>
+        """
+
+        row = parse_harddrivesdirect_product_page(html, "https://www.harddrivesdirect.com/canada/product_info.php?products_id=477385_005049033")
+
+        assert row is not None
+        assert row["part_number"] == "005049033"
+        assert set(row["aliases"]) == {
+            "005048952",
+            "005049033",
+            "005049118",
+            "005049160",
+            "005049694",
+            "005050919",
+            "005050920",
+        }
+        assert row["manufacturer"] == "Dell EMC"
+        assert row["attributes"]["capacity"] == "600GB"
+        assert row["attributes"]["interface"] == "FIBRE CHANNEL"
+        assert row["attributes"]["model_number"] == "CX-4G15-600"
+        assert "VNX 5100" in row["system_models"]
+        assert "CX4 960" in row["system_models"]
+
+
+def test_import_reference_html_imports_emc_product_detail_aliases_and_compatibility(conn: sqlite3.Connection) -> None:
+        html = """
+        <html>
+            <head><title>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</title></head>
+            <body>
+                <h1>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</h1>
+                <p>
+                    Description: Genuine EMC 600GB 15K 3.5-inch 4GB FibreChannel (FC) Hot-Plug Hard Drive
+                    in 3.5-inch EMC Hot-Plug HDD Drive Tray (as pictured)
+                </p>
+                <p>
+                    Part Number(s)
+                    EMC Part# 005048952
+                    EMC Part# 005049033
+                    EMC Part# 005049118
+                    EMC Part# 005049160
+                    EMC Part# 005049694
+                    EMC Part# 005050919
+                    EMC Part# 005050920
+                    Model# CX-4G15-600
+                </p>
+                <p>
+                    Specifications:
+                    Category EMC HardDrive
+                    Sub-Category 15K
+                    Generation Fibre Channel
+                    Part Number 005049033
+                    Products ID 477385
+                    Capacity 600GB
+                    Interface Fibre Channel
+                    Rotational Speed 15000RPM
+                    Manufacturer Dell EMC
+                    Bytes/sector 520
+                    Hot Swap Tray Included
+                </p>
+                <table>
+                    <tr><td>EMC VNX 5100</td><td>EMC VNX 5200</td></tr>
+                    <tr><td>EMC VNXe 3100</td><td>EMC VNXe 3150</td></tr>
+                    <tr><td>EMC CX3 10</td><td>EMC CX3 20</td></tr>
+                    <tr><td>EMC CX4 120</td><td>EMC CX4 240</td></tr>
+                    <tr><td>EMC CX4 480</td><td>EMC CX4 960</td></tr>
+                </table>
+            </body>
+        </html>
+        """
+
+        result = import_reference_html(
+                conn,
+                html=html,
+                page_url="https://www.harddrivesdirect.com/canada/product_info.php?products_id=477385_005049033",
+                source_name="EMC FC HDD Product Detail",
+        )
+
+        alias_rows = conn.execute(
+            "SELECT alias_part_number FROM reference_part_aliases ORDER BY alias_part_number"
+        ).fetchall()
+        models = search_system_models(conn, "VNX 5100")
+        rows = search_reference_parts(conn, "005050919", available_only=False, limit=20)
+
+        assert result.rows_seen == 1
+        assert result.parts_upserted == 1
+        assert result.aliases_upserted == 7
+        assert result.compatibilities_upserted >= 5
+        assert [row[0] for row in alias_rows] == [
+            "005048952",
+            "005049033",
+            "005049118",
+            "005049160",
+            "005049694",
+            "005050919",
+            "005050920",
+        ]
+        assert models
+        assert rows
+        assert rows[0]["reference_part_number"] == "005049033"
+        assert rows[0]["reference_manufacturer"] == "Dell EMC"
+        assert int(rows[0]["compatible_model_count"]) >= 5
+
+
+def test_analyze_reference_html_prefers_product_detail_over_listing_shape() -> None:
+        html = """
+        <html>
+            <head><title>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</title></head>
+            <body>
+                <p>
+                    Description: Genuine EMC 600GB 15K 3.5-inch 4GB Fibre Channel (FC) Hot-Plug Hard Drive
+                </p>
+                <p>
+                    Part Number(s)
+                    EMC Part# 005048952
+                    EMC Part# 005049033
+                    EMC Part# 005049118
+                </p>
+                <p>
+                    Specifications:
+                    Part Number 005049033
+                    Capacity 600GB
+                    Interface Fibre Channel
+                    Manufacturer Dell EMC
+                </p>
+                <table>
+                    <tr><td>005049033 EMC 600-GB 4-GB 15K 3.5 FC HDD</td><td>005049033</td></tr>
+                </table>
+            </body>
+        </html>
+        """
+
+        analysis = analyze_reference_html(html, "https://www.harddrivesdirect.com/canada/product_info.php?products_id=477385_005049033")
+
+        assert analysis.page_kind == "product_detail"
+        assert analysis.rows_detected == 1
+
+
 def test_analyze_reference_html_classifies_product_detail_page() -> None:
         html = """
         <html>

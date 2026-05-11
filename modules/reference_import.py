@@ -35,9 +35,11 @@ MODEL_PATTERNS = [
     re.compile(r"\bEVA\s+M\d+\b"),
     re.compile(r"\bM\d{4}\b"),
     re.compile(r"\b3PAR\b"),
+    re.compile(r"\bVNXE?\s+\d+\b"),
+    re.compile(r"\bCX[34]\s+\d+\b"),
 ]
 
-PART_NUMBER_PATTERN = re.compile(r"\b(?=[A-Z0-9-]*\d)[A-Z0-9]{4,10}-[A-Z0-9]{2,4}\b")
+PART_NUMBER_PATTERN = re.compile(r"\b(?=[A-Z0-9-]*\d)(?:[A-Z0-9]{4,10}-[A-Z0-9]{2,4}|\d{8,10})\b")
 GENERATION_TOKEN_PATTERN = re.compile(r"\b(?:GEN(?:ERATION)?\s*|G)(\d+)(?:\+)?\b", re.I)
 
 
@@ -90,16 +92,19 @@ PRODUCT_ATTRIBUTE_LABELS = {
     "PART NUMBER": "part_number",
     "PRODUCTS ID": "product_id",
     "CAPACITY": "capacity",
+    "FORM FACTOR": "form_factor",
     "INTERFACE": "interface",
     "ENCLOSURE": "enclosure",
     "DRIVE DIMENSIONS": "drive_dimensions",
     "SPINDLE SPEED": "spindle_speed",
+    "ROTATIONAL SPEED": "rotational_speed",
     "EXTERNAL DATA TRANSFER": "external_data_transfer",
     "SEEK TIME": "seek_time",
     "HOTSWAP": "hot_swap",
     "MANUFACTURER": "manufacturer_name",
     "LIMITED WARRANTY": "limited_warranty",
     "HOT SWAP TRAY": "hot_swap_tray",
+    "BYTES/SECTOR": "bytes_per_sector",
     "PORTS": "ports",
 }
 
@@ -179,6 +184,21 @@ def infer_alias_part_numbers(part_number: str) -> list[str]:
     aliases.add(cleaned.replace(" ", ""))
     aliases = {alias.strip("-") for alias in aliases if alias.strip("-")}
     return sorted(aliases)
+
+
+def _detect_reference_manufacturer(*values: str) -> str:
+    combined = " ".join(normalize_text(value) for value in values if value)
+    if not combined:
+        return ""
+    if "DELL EMC" in combined:
+        return "Dell EMC"
+    if "HEWLETT PACKARD ENTERPRISE" in combined or " HPE" in f" {combined}" or "HP " in combined or " PROLIANT" in combined:
+        return "HPE"
+    if "EMC" in combined:
+        return "EMC"
+    if "DELL" in combined:
+        return "Dell"
+    return ""
 
 
 def _upsert_reference_source(
@@ -596,12 +616,19 @@ def parse_harddrivesdirect_listing(html: str, page_url: str) -> list[dict[str, o
 def extract_harddrivesdirect_page_models(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     page_text = normalize_text(soup.get_text(" ", strip=True))
-    compatibility_match = re.search(
+    compatibility_patterns = (
         r"COMPATIBLE WITH (?:THE FOLLOWING|THESE)\s+(.*?)(?:SPECIFICALLY DESIGNED|DISPLAYING \d+ TO \d+|RESULT PAGES|COUNTRY US DOLLAR PRICES|CONTACT US)",
-        page_text,
+        r"COMPATIBLE SERVERS AND STORAGE ARRAYS:\s*(.*?)(?:SHOPPERAPPROVED|PRICE:|WARRANTY:|COUNTRY US DOLLAR PRICES|CONTACT US|$)",
     )
-    if compatibility_match:
-        return extract_candidate_models(compatibility_match.group(1))
+    for pattern in compatibility_patterns:
+        compatibility_match = re.search(pattern, page_text)
+        if compatibility_match:
+            models = extract_candidate_models(compatibility_match.group(1))
+            if models:
+                return models
+    fallback_models = extract_candidate_models(page_text)
+    if len(fallback_models) >= 2:
+        return fallback_models
     return []
 
 
@@ -646,7 +673,7 @@ def parse_harddrivesdirect_search_results(html: str, page_url: str) -> list[dict
 
         seen.add(normalized_part)
         product_url = urljoin(page_url, anchor["href"])
-        manufacturer = "HPE" if any(token in description for token in ("HP ", "HPE", "PROLIANT")) else ""
+        manufacturer = _detect_reference_manufacturer(description)
         rows.append(
             {
                 "part_number": part_number,
@@ -663,14 +690,16 @@ def parse_harddrivesdirect_search_results(html: str, page_url: str) -> list[dict
 
 
 def parse_reference_rows(html: str, page_url: str) -> list[dict[str, object]]:
+    product_row = parse_harddrivesdirect_product_page(html, page_url)
+    if product_row is not None:
+        return [product_row]
     combined_rows = parse_harddrivesdirect_listing(html, page_url)
     if combined_rows:
         return combined_rows
     search_rows = parse_harddrivesdirect_search_results(html, page_url)
     if search_rows:
         return search_rows
-    product_row = parse_harddrivesdirect_product_page(html, page_url)
-    return [product_row] if product_row is not None else []
+    return []
 
 
 def _extract_product_text_block(normalized_text: str, start_label: str, end_labels: tuple[str, ...]) -> str:
@@ -699,8 +728,14 @@ def _extract_product_aliases(normalized_text: str) -> tuple[str, list[str], dict
         alias_attributes[attribute_name] = value
         if attribute_name == "option_part_number":
             primary_part = value
-        else:
+        elif attribute_name != "model_number":
             aliases.append(value)
+
+    generic_part_matches = re.findall(r"\b(?:[A-Z0-9]+\s+)?PART#\s+([A-Z0-9-]+)", aliases_block)
+    for value in generic_part_matches:
+        if value == primary_part:
+            continue
+        aliases.append(value.strip())
 
     if primary_part:
         aliases.append(primary_part)
@@ -718,7 +753,18 @@ def _extract_product_aliases(normalized_text: str) -> tuple[str, list[str], dict
 
 
 def _extract_product_specifications(normalized_text: str) -> dict[str, str]:
-    specs_block = _extract_product_text_block(normalized_text, "SPECIFICATIONS:", ("REPLACEMENT INSTRUCTIONS", "PART#", "QUANTITY:", "OTHER CONDITIONS:"))
+    specs_block = _extract_product_text_block(
+        normalized_text,
+        "SPECIFICATIONS:",
+        (
+            "REPLACEMENT INSTRUCTIONS",
+            "PART#",
+            "QUANTITY:",
+            "OTHER CONDITIONS:",
+            "COMPATIBLE SERVERS AND STORAGE ARRAYS:",
+            "FLAT RATE SHIPPING OPTIONS",
+        ),
+    )
     attributes: dict[str, str] = {}
     for label, attribute_name in PRODUCT_ATTRIBUTE_LABELS.items():
         if label in {"OPTION PART#", "SMARTBUY PART#", "SPARE PART#", "ASSEMBLY PART#", "MODEL#"}:
@@ -743,6 +789,18 @@ def parse_harddrivesdirect_product_page(html: str, page_url: str) -> dict[str, o
         return None
 
     primary_part, aliases, alias_attributes = _extract_product_aliases(normalized_text)
+
+    description_block = _extract_product_text_block(normalized_text, "DESCRIPTION:", ("PART NUMBER(S)", "OVERVIEW:"))
+    description = description_block or normalize_text(title)
+    attributes = alias_attributes
+    attributes.update(_extract_product_specifications(normalized_text))
+    specification_part = str(attributes.get("part_number", "")).strip()
+    if _is_likely_reference_part_number(specification_part):
+        primary_part = specification_part
+    if not primary_part:
+        title_match = PART_NUMBER_PATTERN.search(normalize_text(title))
+        if title_match is not None:
+            primary_part = title_match.group(0)
     if not primary_part:
         part_match = PART_NUMBER_PATTERN.search(normalized_text)
         if part_match is None:
@@ -750,17 +808,20 @@ def parse_harddrivesdirect_product_page(html: str, page_url: str) -> dict[str, o
         primary_part = part_match.group(0)
     if not _is_likely_reference_part_number(primary_part):
         return None
-
-    description_block = _extract_product_text_block(normalized_text, "DESCRIPTION:", ("PART NUMBER(S)", "OVERVIEW:"))
-    description = description_block or normalize_text(title)
-    attributes = alias_attributes
-    attributes.update(_extract_product_specifications(normalized_text))
+    if primary_part and primary_part not in aliases:
+        aliases.append(primary_part)
     page_models = extract_harddrivesdirect_page_models(html)
     if not page_models:
         compatibility_block = _extract_product_text_block(normalized_text, "THIS HP PART#", ("FLAT RATE SHIPPING OPTIONS", "OTHER IN STOCK", "SHOPPERAPPROVED"))
+        if not compatibility_block:
+            compatibility_block = _extract_product_text_block(normalized_text, "COMPATIBLE SERVERS AND STORAGE ARRAYS:", ("FLAT RATE SHIPPING OPTIONS", "OTHER IN STOCK", "SHOPPERAPPROVED"))
         page_models = extract_candidate_models(compatibility_block)
 
-    manufacturer = "HPE" if any(token in description for token in ("HP ", "HPE", "PROLIANT")) else ""
+    manufacturer = _detect_reference_manufacturer(
+        str(attributes.get("manufacturer_name", "")),
+        description,
+        title,
+    )
     product_url = page_url
     return {
         "part_number": primary_part,
@@ -1073,11 +1134,21 @@ def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
 
     page_title = next((candidate.strip() for candidate in title_candidates if candidate and candidate.strip()), page_url)
     normalized_text = normalize_text(soup.get_text(" ", strip=True))
+    product_row = parse_harddrivesdirect_product_page(html, page_url)
     listing_rows = parse_harddrivesdirect_listing(html, page_url)
     search_rows = parse_harddrivesdirect_search_results(html, page_url)
-    product_row = parse_harddrivesdirect_product_page(html, page_url)
     listing_links = extract_harddrivesdirect_listing_links(html, page_url)
     detected_models = extract_harddrivesdirect_page_models(html) or extract_candidate_models(page_title)
+
+    if product_row is not None:
+        return ReferenceHtmlAnalysis(
+            page_kind="product_detail",
+            page_title=page_title,
+            rows_detected=1,
+            listing_links=listing_links,
+            detected_models=detected_models or [str(model) for model in product_row.get("system_models", [])],
+            guidance="This page contains one detailed product record with aliases and specifications and can be imported.",
+        )
 
     if listing_rows:
         return ReferenceHtmlAnalysis(
@@ -1097,16 +1168,6 @@ def analyze_reference_html(html: str, page_url: str) -> ReferenceHtmlAnalysis:
             listing_links=listing_links,
             detected_models=detected_models,
             guidance="This page contains product search results with page-level compatibility context and can be imported.",
-        )
-
-    if product_row is not None:
-        return ReferenceHtmlAnalysis(
-            page_kind="product_detail",
-            page_title=page_title,
-            rows_detected=1,
-            listing_links=listing_links,
-            detected_models=detected_models or [str(model) for model in product_row.get("system_models", [])],
-            guidance="This page contains one detailed product record with aliases and specifications and can be imported.",
         )
 
     if listing_links:

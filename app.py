@@ -378,9 +378,41 @@ with compatibility_tab:
         st.info("No HP/HPE or Dell system models were detected in current inventory descriptions.")
 
     st.markdown("#### Import From Website")
+    st.caption("Use either a HardDrivesDirect listing page or a single product-detail URL. Product pages import one canonical reference part plus aliases, specifications, and detected compatible systems.")
+
+    product_shortcut_columns = st.columns([3, 2, 1])
+    product_reference_url = product_shortcut_columns[0].text_input(
+        "Product detail URL",
+        value="https://www.harddrivesdirect.com/canada/product_info.php?products_id=477385_005049033&currency=CAD",
+        key="compatibility_product_reference_url",
+    )
+    product_source_name = product_shortcut_columns[1].text_input(
+        "Product source label",
+        value="HardDrivesDirect Product",
+        key="compatibility_product_source_name",
+    )
+    product_shortcut_columns[2].write("")
+    product_shortcut_columns[2].write("")
+    if product_shortcut_columns[2].button("Import product URL", key="import_compatibility_product_url"):
+        try:
+            with get_connection() as conn:
+                result = import_reference_url(
+                    conn,
+                    url=product_reference_url.strip(),
+                    source_name=product_source_name.strip() or "HardDrivesDirect Product",
+                )
+        except Exception as exc:
+            st.error(f"Product URL import failed: {exc}")
+        else:
+            st.success(
+                "Product URL import completed. "
+                f"Parsed {result.rows_seen} row(s), added {result.models_upserted} models, "
+                f"{result.parts_upserted} parts, and {result.compatibilities_upserted} compatibility links."
+            )
+
     website_columns = st.columns([3, 2])
     reference_url = website_columns[0].text_input(
-        "Listing URL",
+        "Listing or category URL",
         value="https://www.harddrivesdirect.com/HTML_HP_SAS_SATA_1.php",
         key="compatibility_reference_url",
     )
@@ -390,7 +422,7 @@ with compatibility_tab:
         key="compatibility_source_name",
     )
 
-    if st.button("Fetch and import compatibility page", key="import_compatibility_page"):
+    if st.button("Fetch and import listing URL", key="import_compatibility_page"):
         try:
             with get_connection() as conn:
                 result = import_reference_url(
@@ -402,12 +434,12 @@ with compatibility_tab:
             st.error(f"Compatibility import failed: {exc}")
         else:
             st.success(
-                "Compatibility import completed. "
+                "Listing URL import completed. "
                 f"Parsed {result.rows_seen} rows, added {result.models_upserted} models, "
                 f"{result.parts_upserted} parts, and {result.compatibilities_upserted} compatibility links."
             )
 
-    st.caption("If the website blocks direct fetches, save the listing page as HTML in your browser and import that file below.")
+    st.caption("If the website blocks direct fetches, save the page as HTML in your browser and import that file below.")
 
     saved_html_file = st.file_uploader(
         "Saved compatibility listing HTML",
